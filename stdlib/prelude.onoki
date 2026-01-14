@@ -1,0 +1,6 @@
+(* stdlib/prelude.onoki - Common utilities *)
+
+external int_to_string : int -> string = "static java/lang/String valueOf (I)Ljava/lang/String;"
+
+let id = fun x -> x
+let const = fun x -> fun y -> x

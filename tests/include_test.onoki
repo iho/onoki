@@ -1,0 +1,6 @@
+(* Test file for include system *)
+
+include "../stdlib/prelude.onoki"
+
+let x = 42
+let result = int_to_string x

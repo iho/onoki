@@ -64,6 +64,7 @@ type decl =
   | DeclType of string * ty
   | DeclModule of string * decl list
   | DeclExtern of string * ty * string
+  | DeclInclude of string  (* Path to file *)
   [@@deriving show, eq]
 
 type program = decl list

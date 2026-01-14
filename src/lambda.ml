@@ -292,4 +292,5 @@ let rec lower_program : program -> lambda list = fun decls ->
            (n, Option.map lower_type t_opt)) ctors in
          LVariantDef (name, desc_ctors)
     | DeclType _ -> LTuple [] (* Ignore other types *)
+    | DeclInclude _ -> LTuple [] (* Includes are resolved before lowering *)
   ) decls

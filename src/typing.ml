@@ -762,6 +762,10 @@ let rec type_check_decl (env : env) (decl : decl) : ((string * binding) * env) o
       let binding = BindValue scheme in
       Some ((name, binding), (name, binding) :: env)
 
+  | DeclInclude _ ->
+      (* Includes are resolved before type checking, should not appear here *)
+      failwith "DeclInclude should have been resolved before type checking"
+
   | DeclModule (name, decls) ->
       (* Type check module body using current env for lookups *)
       (* We accumulate local bindings for the module environment *)

@@ -18,6 +18,7 @@
       ; "type", TYPE
       ; "module", MODULE
       ; "open", OPEN
+      ; "include", INCLUDE
       ; "external", EXTERNAL
       ; "true", TRUE
       ; "false", FALSE

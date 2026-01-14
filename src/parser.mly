@@ -5,7 +5,7 @@
 %token <int> INT
 %token <float> FLOAT
 %token <string> STRING LIDENT UIDENT
-%token LET REC IN FUN IF THEN ELSE MATCH WITH TYPE MODULE OPEN EXTERNAL
+%token LET REC IN FUN IF THEN ELSE MATCH WITH TYPE MODULE OPEN EXTERNAL INCLUDE
 %token TRUE FALSE AND OR NOT
 %token LPAREN RPAREN LBRACKET RBRACKET LBRACE RBRACE
 %token PLUS MINUS STAR SLASH MOD
@@ -46,6 +46,8 @@ decl:
       { DeclExtern (name, ty, impl) }
   | MODULE name = UIDENT EQ LBRACE decls = list(decl) RBRACE
       { DeclModule (name, decls) }
+  | INCLUDE path = STRING
+      { DeclInclude path }
 
 type_variants:
   | PIPE? constrs = separated_nonempty_list(PIPE, constructor_decl) { constrs }
