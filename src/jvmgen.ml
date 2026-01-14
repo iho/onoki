@@ -415,7 +415,10 @@ let rec gen_lambda (ctx : codegen_ctx) (expr : lambda) : unit =
        | _ -> ()) (* Float not implemented yet *)
 
   | LExtern (name, impl) ->
-      ctx.externs <- (name, impl) :: ctx.externs
+      ctx.externs <- (name, impl) :: ctx.externs;
+      (* Push nil as placeholder since externs are declarations, not expressions *)
+      let nil_idx = add_fieldref ctx.cpb "OnokiNil" "INSTANCE" "LOnokiNil;" in
+      emit ctx (Getstatic nil_idx)
 
   | LApp (LVar fname, args) when List.mem_assoc fname ctx.externs ->
       let impl = List.assoc fname ctx.externs in
@@ -653,17 +656,29 @@ let rec gen_lambda (ctx : codegen_ctx) (expr : lambda) : unit =
               descriptor = "(Ljava/lang/Object;)Ljava/lang/Object;"; (* Object -> Object *)
             } :: ctx.functions;
             
-            (* 2. Generate Wrapper Closure (Closure$Name) *)
+            (* 2. Generate Wrapper Closure (Closure_Name) *)
             (* Wrapper delegates to Main.name *)
-            (* Body: LApp(LVar name, [Arg]) *)
-            (* Wrapper needs to call static method. Ensure generator sees it. *)
             let wrapper_params = ["_warg"] in
             let wrapper_body = LApp (LVar name, [LVar "_warg"]) in
             let wrapper_captures = [] in (* Stateless *)
             
             let wrapper_bytes = generate_closure_class name wrapper_params wrapper_body wrapper_captures ctx.functions in
             let class_name = "Closure_" ^ name in
-            global_closure_list := (class_name ^ ".class", wrapper_bytes) :: !global_closure_list
+            global_closure_list := (class_name ^ ".class", wrapper_bytes) :: !global_closure_list;
+            
+            (* 3. Instantiate wrapper and store in local variable *)
+            let class_idx = add_class ctx.cpb class_name in
+            emit ctx (New class_idx);
+            emit ctx Dup;
+            let init_idx = add_methodref ctx.cpb class_name "<init>" "()V" in
+            emit ctx (Invokespecial init_idx);
+            let slot = alloc_local ctx name in
+            if slot <= 3 then
+              emit ctx (match slot with
+                | 0 -> Astore_0 | 1 -> Astore_1 | 2 -> Astore_2 | 3 -> Astore_3
+                | _ -> failwith "impossible")
+            else
+              emit ctx (Astore slot)
             
         | _ ->
             (* Non-function recursive binding - treat as regular let *)
@@ -819,7 +834,8 @@ let rec gen_lambda (ctx : codegen_ctx) (expr : lambda) : unit =
   | LInstanceof (e, cls) ->
        gen_lambda ctx e;
        let cls_idx = add_class ctx.cpb cls in
-       emit ctx (Instanceof cls_idx)
+       emit ctx (Instanceof cls_idx);
+       box_bool ctx
 
   | LCheckCast (e, cls) ->
        gen_lambda ctx e;
@@ -1377,6 +1393,7 @@ let generate_record_class (name : string) (fields : (string * string) list) : by
   (* Code generation for constructor *)
   let ctx = create_context () in
   ctx.cpb <- cpb;
+  ctx.next_local <- 1 + List.length fields; (* this + all args *)
   (* this + args *)
   emit ctx Aload_0;
   let super_init = add_methodref cpb "java/lang/Object" "<init>" "()V" in
@@ -1670,34 +1687,21 @@ let generate_classes (prog : lambda list) : (string * bytes) list =
   let main_class_idx = add_class main_cpb "Main" in
   let object_class_idx = add_class main_cpb "java/lang/Object" in
   
+  (* Pre-add common runtime references to ensure consistent CP ordering *)
+  let _ = add_class main_cpb "OnokiNil" in
+  let _ = add_fieldref main_cpb "OnokiNil" "INSTANCE" "LOnokiNil;" in
+  
   (* Generate methods for top-level code *)
   (* For each LLet/LLetRec, generate static field and <clinit> *)
   (* Actually simplified: put all top-level code in main function *)
   
   (* Extract function definitions *)
   let ctx = create_context () in
+  ctx.cpb <- main_cpb; (* Use Main's constant pool *)
   ctx.next_local <- 1; (* Reserve local 0 for args *)
   
   (* Pre-scan for LLetRec functions *)
-  let scan_functions p = 
-    List.iter (function
-      | LLetRec (bindings, _) ->
-          List.iter (fun (name, expr) ->
-             match expr with
-             | LFun (params, body) ->
-                 (* Register global function *)
-                 ctx.functions <- {
-                   name;
-                   params;
-                   body;
-                   descriptor = "(Ljava/lang/Object;)Ljava/lang/Object;";
-                 } :: ctx.functions
-             | _ -> ()
-          ) bindings
-      | _ -> ()
-    ) p
-  in
-  scan_functions prog;
+  (* Note: Functions are registered during gen_lambda when LLetRec is processed *)
   
   (* Main Method *)
   let main_code = 
@@ -1740,7 +1744,11 @@ let generate_classes (prog : lambda list) : (string * bytes) list =
     ];
   } in
   
-  let main_bytes = generate_class_file main_cpb acc_public main_class_idx object_class_idx [] [] [main_method] in
+  (* Generate static methods for all registered functions *)
+  let function_methods = List.map (generate_function_method main_cpb ctx.functions) ctx.functions in
+  let all_methods = main_method :: function_methods in
+  
+  let main_bytes = generate_class_file main_cpb acc_public main_class_idx object_class_idx [] [] all_methods in
 
   (* Generate Interface OnokiFunction *)
   let interface_bytes = generate_interface_OnokiFunction () in

@@ -168,12 +168,18 @@ let rec lower_expr : expr -> lambda = function
   | Match (scrutinee, cases) ->
       compile_match (lower_expr scrutinee) cases
   | Field (e, field, class_ref) ->
-      (* Use captured class name from type checker if available *)
-      (match !class_ref with
-       | Some cls -> LGetField (lower_expr e, cls, field)
-       | None -> 
-           (* Fallback for tests/untyped paths or structural? *)
-           LField (lower_expr e, 0))
+      (* Handle Module.field access (parsed as Field(Variant("Module", None), "field")) *)
+      (match e with
+       | Variant (mod_name, None) ->
+           (* This is actually a qualified module access: Module.field *)
+           LVar (mod_name ^ "." ^ field)
+       | _ ->
+           (* Use captured class name from type checker if available *)
+           (match !class_ref with
+            | Some cls -> LGetField (lower_expr e, cls, field)
+            | None -> 
+                (* Fallback for tests/untyped paths or structural? *)
+                LField (lower_expr e, 0)))
   | Record (name_ref, fields) ->
        (match !name_ref with
         | Some name ->

@@ -1,10 +1,12 @@
+type option = Some of int | None
+
+let show = fun opt ->
+  match opt with
+  | Some x -> println x
+  | None -> println 0
+
 let s = Some 10
 let n = None
 
-let d1 = match s with
-  | Some x -> println x
-  | None -> println 0
-
-let d2 = match n with
-  | Some x -> println x
-  | None -> println 0
+let d1 = show s
+let d2 = show n
