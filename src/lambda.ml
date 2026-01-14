@@ -19,6 +19,10 @@ type lambda =
   | LRecordDef of string * (string * string) list (* Name, (Field, Descriptor) *)
   | LNewRecord of string * lambda list (* Name, Args *)
   | LGetField of lambda * string * string (* Expr, Class, Field *)
+  | LNewVariant of string * lambda list (* Name, Args *)
+  | LInstanceof of lambda * string (* Expr, Class *)
+  | LCheckCast of lambda * string (* Expr, Class *)
+  | LVariantDef of string * (string * string option) list (* TypeName, (CtorName, ArgDesc option) *)
 
 and constant =
   | CInt of int
@@ -92,13 +96,22 @@ let rec show_lambda = function
       Printf.sprintf "(record %s { %s })" name (String.concat "; " (List.map show_field fields))
   | LNewRecord (name, args) ->
       Printf.sprintf "(new %s %s)" name (String.concat " " (List.map show_lambda args))
+  | LNewVariant (name, args) ->
+      Printf.sprintf "(variant %s %s)" name (String.concat " " (List.map show_lambda args))
   | LGetField (e, cls, f) ->
       Printf.sprintf "%s.%s::%s" (show_lambda e) cls f
+  | LInstanceof (e, cls) ->
+      Printf.sprintf "(%s instanceof %s)" (show_lambda e) cls
+  | LCheckCast (e, cls) ->
+      Printf.sprintf "((%s)%s)" cls (show_lambda e)
+  | LVariantDef (name, ctors) ->
+      let show_ctor (n, arg) = Printf.sprintf "%s%s" n (match arg with Some t -> "(" ^ t ^ ")" | None -> "") in
+      Printf.sprintf "(type %s = %s)" name (String.concat " | " (List.map show_ctor ctors))
 
 (* Lowering type to JVM descriptor *)
 let lower_type : ty -> string = function
-  | TyInt -> "I"
-  | TyFloat -> "F"
+  | TyInt -> "Ljava/lang/Object;"
+  | TyFloat -> "Ljava/lang/Object;"
   | TyBool | TyString | TyList _ | TyTuple _ | TyFun _ | TyVar _ -> "Ljava/lang/Object;" (* Boxed/Unknown *)
   | TyRecord (Some name, _) -> "L" ^ name ^ ";" 
   | TyRecord (None, _) -> "Ljava/lang/Object;" 
@@ -160,23 +173,10 @@ let rec lower_expr : expr -> lambda = function
        | Some cls -> LGetField (lower_expr e, cls, field)
        | None -> 
            (* Fallback for tests/untyped paths or structural? *)
-           (* Or maybe it's tuple access? TODO *)
            LField (lower_expr e, 0))
   | Record (name_ref, fields) ->
        (match !name_ref with
         | Some name ->
-            (* Generate new Name(args) *)
-            (* Assumption: AST fields are in definition order? No. *)
-            (* POJO constructor usually takes args in def order? *)
-            (* Or setters? *)
-            (* Implementation Plan assumption: POJO with constructor (x, y) *)
-            (* I need to sort fields or lookup definition to know order! *)
-            (* But 'lower' doesn't have env. *)
-            (* Hack: sort fields by name? If definition is sorted? *)
-            (* In 'typing.ml', unification sorted names? *)
-            (* Standard Java tooling sorts? No. *)
-            (* I MUST ensure constructor arg order matches. *)
-            (* FOR NOW: sort by name alphabet. *)
             let sorted_fields = List.sort (fun (a,_) (b,_) -> String.compare a b) fields in
             let args = List.map (fun (_, e) -> lower_expr e) sorted_fields in
             LNewRecord (name, args)
@@ -184,8 +184,8 @@ let rec lower_expr : expr -> lambda = function
             LTuple (List.map (fun (_, e) -> lower_expr e) fields))
   | Variant (name, opt_expr) ->
       (match opt_expr with
-       | None -> LVar name
-       | Some e -> LApp (LVar name, [lower_expr e]))
+       | None -> LNewVariant (name, [])
+       | Some e -> LNewVariant (name, [lower_expr e]))
   | Seq exprs ->
       List.fold_right
         (fun e acc -> LLet ("_", lower_expr e, acc))
@@ -243,7 +243,20 @@ and compile_match scrutinee cases : lambda =
                       fail)
         in
         match_list_pats scr pats
-    | _ -> failwith "Unsupported pattern in lower (Record/Variant)"
+        
+    | PatVariant (cname, subpat_opt) ->
+        LIf (LInstanceof (scr, cname),
+             (match subpat_opt with
+              | Some p -> 
+                   (* Cast to Constructor class *)
+                   let cast_scr = LCheckCast (scr, cname) in
+                   (* Access value field *)
+                   let val_field = LGetField (cast_scr, cname, "value") in
+                   compile_pattern val_field p next fail
+              | None -> next),
+             fail)
+
+    | _ -> failwith "Unsupported pattern in lower (Record)"
   in
 
   let scrutinee_var = fresh_name "match_scr" in
@@ -265,12 +278,12 @@ let rec lower_program : program -> lambda list = fun decls ->
     | DeclExtern (name, _ty, impl) -> LExtern (name, impl)
     | DeclModule (name, subdecls) -> LModule (name, lower_program subdecls)
     | DeclType (name, TyRecord (_, fields)) ->
-         (* Generate record definition *)
-         (* Convert field types to descriptors *)
-         (* Assuming definition fields are types. *)
-         (* Sort by name? Yes, to match Constructor assumption. *)
          let sorted_fields = List.sort (fun (a,_) (b,_) -> String.compare a b) fields in
          let desc_fields = List.map (fun (n, t) -> (n, lower_type t)) sorted_fields in
          LRecordDef (name, desc_fields)
+    | DeclType (name, TyVariant (_, ctors)) ->
+         let desc_ctors = List.map (fun (n, t_opt) -> 
+           (n, Option.map lower_type t_opt)) ctors in
+         LVariantDef (name, desc_ctors)
     | DeclType _ -> LTuple [] (* Ignore other types *)
   ) decls

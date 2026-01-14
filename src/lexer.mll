@@ -24,12 +24,14 @@
       ; "and", AND
       ; "or", OR
       ; "not", NOT
+      ; "of", OF
       ]
 }
 
 let digit = ['0'-'9']
-let alpha = ['a'-'z' 'A'-'Z' '_']
-let alnum = alpha | digit | '\''
+let lower_alpha = ['a'-'z' '_']
+let upper_alpha = ['A'-'Z']
+let alnum = lower_alpha | upper_alpha | digit | '\''
 let whitespace = [' ' '\t' '\r']
 let newline = '\n' | "\r\n"
 
@@ -66,10 +68,14 @@ rule token = parse
   | ','             { COMMA }
   | '|'             { PIPE }
   | '_'             { UNDERSCORE }
-  | alpha alnum* as id 
-  | '\'' alpha alnum* as id
+  
+  | lower_alpha alnum* as id 
       { try Hashtbl.find keyword_table id 
-        with Not_found -> IDENT id }
+        with Not_found -> LIDENT id }
+  
+  | upper_alpha alnum* as id
+      { UIDENT id }
+
   | eof             { EOF }
   | _ as c          { raise (LexError (Printf.sprintf "Unexpected character: %c" c)) }
 

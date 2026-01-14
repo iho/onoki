@@ -90,6 +90,7 @@ type instruction =
   | Nop
   | Athrow
   | Checkcast of int (* class index *)
+  | Instanceof of int (* class index *)
 
 (* Encode single instruction to bytes *)
 let encode_instruction (instr : instruction) : bytes =
@@ -240,6 +241,7 @@ let encode_instruction (instr : instruction) : bytes =
    | Nop -> add_u1 0x00
    | Athrow -> add_u1 0xbf
    | Checkcast idx -> add_u1 0xc0; add_u2 idx
+  | Instanceof idx -> add_u1 0xc1; add_u2 idx
   );
   
   Buffer.to_bytes buf

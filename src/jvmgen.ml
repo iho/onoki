@@ -53,7 +53,7 @@ let rec free_vars (expr : lambda) : StringSet.t =
       if List.mem x ["__add"; "__sub"; "__mul"; "__div"; "__mod"; 
                      "__eq"; "__ne"; "__lt"; "__le"; "__gt"; "__ge"; 
                      "__and"; "__or"; "__not"; "__neg";
-                     "cons"; "nil"; "head"; "tail"; "is_empty"; "^"; "failwith"] then
+                     "cons"; "nil"; "head"; "tail"; "is_empty"; "^"; "failwith"; "println"] then
         StringSet.empty 
       else 
         StringSet.singleton x
@@ -73,7 +73,15 @@ let rec free_vars (expr : lambda) : StringSet.t =
       StringSet.union (free_vars c) (StringSet.union (free_vars t) (free_vars e))
   | LTuple exprs ->
       List.fold_left (fun acc e -> StringSet.union acc (free_vars e)) StringSet.empty exprs
-  (* Add other cases as empty for now *)
+  | LNewVariant (_, args) ->
+      List.fold_left (fun acc e -> StringSet.union acc (free_vars e)) StringSet.empty args
+  | LNewRecord (_, args) ->
+      List.fold_left (fun acc e -> StringSet.union acc (free_vars e)) StringSet.empty args
+  | LInstanceof (e, _) 
+  | LCheckCast (e, _) 
+  | LGetField (e, _, _) 
+  | LField (e, _) -> 
+      free_vars e
   | _ -> StringSet.empty
 
 (* Allocate a local variable slot *)
@@ -129,6 +137,15 @@ let update_stack_depth (ctx : codegen_ctx) (instr : instruction) : unit =
     | Invokevirtual _ -> -1  (* Simplified, depends on method signature *)
     | Invokestatic _ -> 0  (* Simplified *)
     | Getstatic _ -> 1
+    
+    | New _ -> 1
+
+    
+    | Checkcast _ -> 0
+    | Instanceof _ -> 0 (* Pop 1, Push 1 *)
+    
+    | Swap -> 0 (* Pop 2, Push 2 *)
+    | Dup_x1 -> 1 (* Push 1 *)
     
     | _ -> 0  (* Conservative *)
   in
@@ -450,7 +467,7 @@ let rec gen_lambda (ctx : codegen_ctx) (expr : lambda) : unit =
             match List.find_opt (fun f -> f.name = x) ctx.functions with
             | Some _func ->
                (* Instantiate wrapper closure *)
-               let class_name = "Closure$" ^ x in
+               let class_name = "Closure_" ^ x in
                let class_idx = add_class ctx.cpb class_name in
                emit ctx (New class_idx);
                emit ctx Dup;
@@ -645,7 +662,7 @@ let rec gen_lambda (ctx : codegen_ctx) (expr : lambda) : unit =
             let wrapper_captures = [] in (* Stateless *)
             
             let wrapper_bytes = generate_closure_class name wrapper_params wrapper_body wrapper_captures ctx.functions in
-            let class_name = "Closure$" ^ name in
+            let class_name = "Closure_" ^ name in
             global_closure_list := (class_name ^ ".class", wrapper_bytes) :: !global_closure_list
             
         | _ ->
@@ -695,7 +712,7 @@ let rec gen_lambda (ctx : codegen_ctx) (expr : lambda) : unit =
       incr global_closure_counter;
       
       let closure_bytes = generate_closure_class id params body captures ctx.functions in
-      let class_name = "Closure$" ^ id in
+      let class_name = "Closure_" ^ id in
       global_closure_list := (class_name ^ ".class", closure_bytes) :: !global_closure_list;
       
       (* 3. Instantiate closure *)
@@ -743,12 +760,71 @@ let rec gen_lambda (ctx : codegen_ctx) (expr : lambda) : unit =
        let init_idx = add_methodref ctx.cpb name "<init>" init_sig in
        emit ctx (Invokespecial init_idx)
 
+  | LNewVariant (name, args) ->
+       (match args with
+        | [] -> 
+            (* Singleton 0-ary constructor *)
+            let field_ref = add_fieldref ctx.cpb name "INSTANCE" ("L" ^ name ^ ";") in
+            emit ctx (Getstatic field_ref)
+        | [arg] ->
+            let class_idx = add_class ctx.cpb name in
+            emit ctx (New class_idx);
+            emit ctx Dup;
+            gen_lambda ctx arg;
+            (* Assuming generic Object payload for simplicity or matching descriptor *)
+            (* In generate_variant_classes we accepted explicit type in LVariantDef *)
+            (* BUT here in gen_lambda we don't know the exact type from lambda IR easily without context *)
+            (* In lower_program, we used lower_type. *)
+            (* If we used "I" (int), we should NOT checkcast Object. *)
+            (* Wait, generated class expects what `lower_type` produced. *)
+            (* If `lower_type` produced `I`, constructor takes `I`. *)
+            (* `gen_lambda` produces value on stack. *)
+            (* Unboxing? *)
+            (* `gen_lambda` usually leaves boxed values (Int -> Integer). *)
+            (* If constructor expects `I` (int), we MUST unbox! *)
+            (* How to know expected type? *)
+            (* `LNewVariant` stores only name and args. *)
+            (* We lack the type info here. *)
+            (* Hack: Try to infer or standardize on Object for now? *)
+            (* `lower_type` DOES produce I, F, etc. *)
+            (* So Generated Class `Some` expects `I` if `Some of int`. *)
+            (* `gen_lambda` producing `Integer`. *)
+            (* We have a mismatch! *)
+            (* Solution: Box everything in `lower_type` for variants too? *)
+            (* Line 102 in lambda.ml: `TyBool | TyString ... -> Ljava/lang/Object` *)
+            (* `TyInt -> "I"`. *)
+            (* If I change `lower_type` to always return Object for variant fields, it simplifies everything. *)
+            (* Boxing is standard for polymorphic variants. *)
+            (* Let's change `lower_type` in `lambda.ml` to return Object for `TyInt` inside Variants? *)
+            (* `lower_type` is generic. *)
+            (* I should update `lower_type` to be conservative or update `gen_lambda` to handle it. *)
+            (* Updating `gen_lambda` is hard without knowing type. *)
+            (* Update `lower_type` to force Object? *)
+            (* Let's assume Object everywhere for Variants. simpler. *)
+            
+            let obj_idx = add_class ctx.cpb "java/lang/Object" in 
+            emit ctx (Checkcast obj_idx);
+            
+            let init_idx = add_methodref ctx.cpb name "<init>" "(Ljava/lang/Object;)V" in
+            emit ctx (Invokespecial init_idx)
+        | _ -> failwith "Variant with >1 args not supported yet")
+
   | LGetField (e, cls, f) ->
        gen_lambda ctx e;
        let cls_idx = add_class ctx.cpb cls in
        emit ctx (Checkcast cls_idx);
        let field_ref = add_fieldref ctx.cpb cls f "Ljava/lang/Object;" in
        emit ctx (Getfield field_ref)
+
+  | LInstanceof (e, cls) ->
+       gen_lambda ctx e;
+       let cls_idx = add_class ctx.cpb cls in
+       emit ctx (Instanceof cls_idx)
+
+  | LCheckCast (e, cls) ->
+       gen_lambda ctx e;
+       let cls_idx = add_class ctx.cpb cls in
+       emit ctx (Checkcast cls_idx)
 
   | stmt ->
       failwith ("Unsupported Lambda form in codegen: " ^ (show_lambda stmt))
@@ -775,7 +851,7 @@ and generate_closure_class (id : string) (params : string list) (body : lambda) 
     }
   *)
   let closure_cpb = create_cp_builder () in
-  let class_name = "Closure$" ^ id in
+  let class_name = "Closure_" ^ id in
   let this_class_idx = add_class closure_cpb class_name in
   let super_class_idx = add_class closure_cpb "java/lang/Object" in
   let interface_class_idx = add_class closure_cpb "OnokiFunction" in
@@ -1263,10 +1339,27 @@ let generate_module_class (name : string) (decls : lambda list) (functions: func
   } in
   (name ^ ".class", write_class_file class_file)
 
+(* Helper: Generate class file wrapper *)
+let generate_class_file cpb access_flags this_idx super_idx interfaces fields methods =
+  let class_file = {
+    minor_version = 0;
+    major_version = 50;
+    constant_pool = cpb;
+    access_flags = access_flags;
+    this_class = this_idx;
+    super_class = super_idx;
+    interfaces = interfaces;
+    fields = fields;
+    methods = methods;
+    attributes = [];
+  } in
+  write_class_file class_file
+
 (* Generate POJO for Record *)
-and generate_record_class (name : string) (fields : (string * string) list) : bytes =
+let generate_record_class (name : string) (fields : (string * string) list) : bytes =
   let cpb = create_cp_builder () in
   let this_idx = add_class cpb name in
+
   let super_idx = add_class cpb "java/lang/Object" in
   
   (* Fields *)
@@ -1281,12 +1374,10 @@ and generate_record_class (name : string) (fields : (string * string) list) : by
   let init_name_idx = add_utf8 cpb "<init>" in
   let init_desc_idx = add_utf8 cpb init_sig in
   
+  (* Code generation for constructor *)
   let ctx = create_context () in
   ctx.cpb <- cpb;
-  ctx.next_local <- 1; (* this *)
-  (* Allocate locals for args *)
-  List.iter (fun _ -> ctx.next_local <- ctx.next_local + 1) fields; (* Assuming 1 slot per arg *)
-  
+  (* this + args *)
   emit ctx Aload_0;
   let super_init = add_methodref cpb "java/lang/Object" "<init>" "()V" in
   emit ctx (Invokespecial super_init);
@@ -1346,124 +1437,340 @@ and generate_record_class (name : string) (fields : (string * string) list) : by
   } in
   write_class_file class_file
 
+(* Runtime Classes *)
+module Runtime = struct
+  let generate_Cons_class () : bytes =
+    let cpb = create_cp_builder () in
+    let this_idx = add_class cpb "OnokiCons" in
+    let super_idx = add_class cpb "java/lang/Object" in
+    
+    let head_field = { access_flags = acc_public; name_index = add_utf8 cpb "head"; descriptor_index = add_utf8 cpb "Ljava/lang/Object;"; attributes = [] } in
+    let tail_field = { access_flags = acc_public; name_index = add_utf8 cpb "tail"; descriptor_index = add_utf8 cpb "Ljava/lang/Object;"; attributes = [] } in
+    
+    let init_method : method_info = {
+      access_flags = acc_public;
+      name_index = add_utf8 cpb "<init>";
+      descriptor_index = add_utf8 cpb "(Ljava/lang/Object;Ljava/lang/Object;)V";
+      attributes = [
+        Code {
+          max_stack = 2;
+          max_locals = 3;
+          code = encode_instructions [
+            Aload_0; Invokespecial (add_methodref cpb "java/lang/Object" "<init>" "()V");
+            Aload_0; Aload_1; Putfield (add_fieldref cpb "OnokiCons" "head" "Ljava/lang/Object;");
+            Aload_0; Aload_2; Putfield (add_fieldref cpb "OnokiCons" "tail" "Ljava/lang/Object;");
+            Return
+          ];
+          exception_table = [];
+          attributes = [];
+        }
+      ]
+    } in
+    generate_class_file cpb acc_public this_idx super_idx [] [head_field; tail_field] [init_method]
+
+  let generate_Nil_class () : bytes =
+    let cpb = create_cp_builder () in
+    let this_idx = add_class cpb "OnokiNil" in
+    let super_idx = add_class cpb "java/lang/Object" in
+    
+    let instance_field = { access_flags = (acc_public lor acc_static lor acc_final); name_index = add_utf8 cpb "INSTANCE"; descriptor_index = add_utf8 cpb "LOnokiNil;"; attributes = [] } in
+    
+    let init_method : method_info = {
+      access_flags = acc_private;
+      name_index = add_utf8 cpb "<init>";
+      descriptor_index = add_utf8 cpb "()V";
+      attributes = [
+        Code {
+          max_stack = 1; max_locals = 1;
+          code = encode_instructions [Aload_0; Invokespecial (add_methodref cpb "java/lang/Object" "<init>" "()V"); Return];
+          exception_table = []; attributes = [];
+        }
+      ]
+    } in
+    
+    let clinit_method : method_info = {
+      access_flags = (acc_public lor acc_static);
+      name_index = add_utf8 cpb "<clinit>";
+      descriptor_index = add_utf8 cpb "()V";
+      attributes = [
+        Code {
+          max_stack = 2; max_locals = 0;
+          code = encode_instructions [New this_idx; Dup; Invokespecial (add_methodref cpb "OnokiNil" "<init>" "()V"); Putstatic (add_fieldref cpb "OnokiNil" "INSTANCE" "LOnokiNil;"); Return];
+          exception_table = []; attributes = [];
+        }
+      ]
+    } in
+    generate_class_file cpb acc_public this_idx super_idx [] [instance_field] [init_method; clinit_method]
+
+  let generate_runtime_classes () =
+    [("OnokiCons.class", generate_Cons_class ());
+     ("OnokiNil.class", generate_Nil_class ())]
+end
+
+let generate_interface_OnokiFunction () : bytes =
+  let cpb = create_cp_builder () in
+  let this_idx = add_class cpb "OnokiFunction" in
+  let super_idx = add_class cpb "java/lang/Object" in
+  
+  let apply_method : method_info = {
+    access_flags = (acc_public lor acc_abstract);
+    name_index = add_utf8 cpb "apply";
+    descriptor_index = add_utf8 cpb "(Ljava/lang/Object;)Ljava/lang/Object;";
+    attributes = [];
+  } in
+  generate_class_file cpb (acc_public lor acc_interface lor acc_abstract) this_idx super_idx [] [] [apply_method]
+
+(* Generate abstract base class for variant *)
+let generate_variant_base_class (name : string) : bytes =
+  let cpb = create_cp_builder () in
+  let this_class_idx = add_class cpb name in
+  let super_class_idx = add_class cpb "java/lang/Object" in
+  
+  let methods = [
+    (* Default constructor *)
+    ({
+      access_flags = acc_public;
+      name_index = add_utf8 cpb "<init>";
+      descriptor_index = add_utf8 cpb "()V";
+      attributes = [
+        Code {
+          max_stack = 1;
+          max_locals = 1;
+          code = encode_instructions [
+            Aload_0;
+            Invokespecial (add_methodref cpb "java/lang/Object" "<init>" "()V");
+            Return
+          ];
+          exception_table = [];
+          attributes = [];
+        }
+      ]
+    } : method_info)
+  ] in
+  
+  generate_class_file cpb (acc_public lor acc_abstract) this_class_idx super_class_idx [] [] methods
+
+(* Generate concrete constructor class for variant *)
+let generate_variant_ctor_class (base_name : string) (ctor_name : string) (arg_desc : string option) : bytes =
+  let cpb = create_cp_builder () in
+  let this_class_idx = add_class cpb ctor_name in
+  let super_class_idx = add_class cpb base_name in
+  
+  let fields, methods = 
+    match arg_desc with
+    | Some desc ->
+        (* Field for payload *)
+        let field_list = [{
+          access_flags = acc_public;
+          name_index = add_utf8 cpb "value";
+          descriptor_index = add_utf8 cpb desc;
+          attributes = [];
+        }] in
+        
+        (* Constructor(arg) *)
+        let init_method : method_info = {
+          access_flags = acc_public;
+          name_index = add_utf8 cpb "<init>";
+          descriptor_index = add_utf8 cpb ("(" ^ desc ^ ")V");
+          attributes = [
+            Code {
+              max_stack = 2;
+              max_locals = 2; (* this, arg *)
+              code = encode_instructions [
+                Aload_0;
+                Invokespecial (add_methodref cpb base_name "<init>" "()V");
+                Aload_0;
+                (match desc with
+                 | "I" -> Iload_1
+                 | "F" -> Fload_1
+                 | "D" -> Dload_1
+                 | "J" -> Iload_1 (* Long load *)
+                 | _ -> Aload_1);
+                Putfield (add_fieldref cpb ctor_name "value" desc);
+                Return
+              ];
+              exception_table = [];
+              attributes = [];
+            }
+          ]
+        } in
+        (field_list, [init_method])
+        
+    | None ->
+        (* Fields: INSTANCE for singleton *)
+        let field_list = [{
+          access_flags = (acc_public lor acc_static lor acc_final);
+          name_index = add_utf8 cpb "INSTANCE";
+          descriptor_index = add_utf8 cpb ("L" ^ ctor_name ^ ";");
+          attributes = [];
+        }] in
+        
+        (* Constructor() *)
+        let init_method : method_info = {
+          access_flags = acc_private; (* Private for singleton *)
+          name_index = add_utf8 cpb "<init>";
+          descriptor_index = add_utf8 cpb "()V";
+          attributes = [
+            Code {
+              max_stack = 1;
+              max_locals = 1;
+              code = encode_instructions [
+                Aload_0;
+                Invokespecial (add_methodref cpb base_name "<init>" "()V");
+                Return
+              ];
+              exception_table = [];
+              attributes = [];
+            }
+          ]
+        } in
+        
+        (* <clinit> to initialize INSTANCE *)
+        let clinit_method : method_info = {
+          access_flags = (acc_public lor acc_static);
+          name_index = add_utf8 cpb "<clinit>";
+          descriptor_index = add_utf8 cpb "()V";
+          attributes = [
+            Code {
+              max_stack = 2;
+              max_locals = 0;
+              code = encode_instructions [
+                New this_class_idx;
+                Dup;
+                Invokespecial (add_methodref cpb ctor_name "<init>" "()V");
+                Putstatic (add_fieldref cpb ctor_name "INSTANCE" ("L" ^ ctor_name ^ ";"));
+                Return
+              ];
+              exception_table = [];
+              attributes = [];
+            }
+          ]
+        } in
+        (field_list, [init_method; clinit_method])
+  in
+  
+  generate_class_file cpb acc_public this_class_idx super_class_idx [] fields methods
+
+(* Helper to generate all classes for a variant definition *)
+let generate_variant_classes (def : lambda) : (string * bytes) list =
+  match def with
+  | LVariantDef (name, ctors) ->
+      let base_class = (name ^ ".class", generate_variant_base_class name) in
+      let ctor_classes = List.map (fun (cname, arg_opt) ->
+        let desc = match arg_opt with Some d -> Some d | None -> None in
+        (cname ^ ".class", generate_variant_ctor_class name cname desc)
+      ) ctors in
+      base_class :: ctor_classes
+  | _ -> []
+
 (* Generate all classes *)
 let generate_classes (prog : lambda list) : (string * bytes) list =
   (* 1. Generate Main class *)
-  reset_labels ();
-  global_closure_counter := 0;
-  global_closure_list := [];
+  let main_cpb = create_cp_builder () in
+  let main_class_idx = add_class main_cpb "Main" in
+  let object_class_idx = add_class main_cpb "java/lang/Object" in
   
-  (* Generate runtime classes *)
-  let list_classes = generate_list_classes () in
+  (* Generate methods for top-level code *)
+  (* For each LLet/LLetRec, generate static field and <clinit> *)
+  (* Actually simplified: put all top-level code in main function *)
+  
+  (* Extract function definitions *)
   let ctx = create_context () in
+  ctx.next_local <- 1; (* Reserve local 0 for args *)
   
-  (* Reserve local 0 for 'args' parameter *)
-  ctx.next_local <- 1;
-  
-  (* Separate modules and records from main program *)
-  let modules = List.filter_map (function
-    | LModule (name, decls) -> Some (name, decls)
-    | _ -> None
-  ) prog in
-  
-  let records = List.filter_map (function
-    | LRecordDef (name, fields) -> Some (name, fields)
-    | _ -> None
-  ) prog in
-  
-  let main_prog = List.filter (function
-    | LModule _ -> false
-    | LRecordDef _ -> false
-    | _ -> true
-  ) prog in
-
-  (* Generate code for program *)
-  let rec gen_prog = function
-    | [] -> ()
-    | [last] -> 
-        gen_lambda ctx last;
-        (* Print result *)
-        let print_stream_idx = add_fieldref ctx.cpb "java/lang/System" "out" "Ljava/io/PrintStream;" in
-        let println_idx = add_methodref ctx.cpb "java/io/PrintStream" "println" "(Ljava/lang/Object;)V" in
-        emit ctx (Getstatic print_stream_idx);
-        emit ctx Swap;
-        emit ctx (Invokevirtual println_idx)
-    | stmt :: rest ->
-        (match stmt with
-         | LExtern _ -> 
-             gen_lambda ctx stmt;
-             gen_prog rest
-         | _ -> 
-             gen_lambda ctx stmt;
-             emit ctx Pop; (* Discard result of declaration *)
-             gen_prog rest)
+  (* Pre-scan for LLetRec functions *)
+  let scan_functions p = 
+    List.iter (function
+      | LLetRec (bindings, _) ->
+          List.iter (fun (name, expr) ->
+             match expr with
+             | LFun (params, body) ->
+                 (* Register global function *)
+                 ctx.functions <- {
+                   name;
+                   params;
+                   body;
+                   descriptor = "(Ljava/lang/Object;)Ljava/lang/Object;";
+                 } :: ctx.functions
+             | _ -> ()
+          ) bindings
+      | _ -> ()
+    ) p
   in
-  gen_prog main_prog;
+  scan_functions prog;
   
+  (* Main Method *)
+  let main_code = 
+    (* Execute all top-level statements *)
+    (* Filter out Defs and Modules *)
+    let stmts = List.filter (function
+      | LModule _ -> false
+      | LRecordDef _ -> false
+      | LVariantDef _ -> false
+      | _ -> true
+    ) prog in
+    
+    (* Wrap in Sequence *)
+    match stmts with
+    | [] -> LConst (CInt 0)
+    | [s] -> s
+    | s :: ss ->
+        List.fold_left (fun acc s -> LLet ("_", acc, s)) s ss 
+  in
+  
+  gen_lambda ctx main_code;
+  emit ctx Pop; (* Consumes result of main body *)
   emit ctx Return;
   
-  (* Resolve labels in main method *)
-  let resolved_main_instrs = resolve_labels ctx in
-  let main_code_bytes = encode_instructions resolved_main_instrs in
+  (* Resolve branches *)
+  let main_instrs = resolve_labels ctx in
   
-  (* Pre-add "Code" to constant pool before creating attribute *)
-  let _code_name_idx = add_utf8 ctx.cpb "Code" in
-  
-  let main_code_attr = Code {
-    max_stack = ctx.max_stack + 2;
-    max_locals = ctx.next_local;
-    code = main_code_bytes;
-    exception_table = [];
-    attributes = [];
-  } in
-  
-  (* Build main method *)
-  let main_name_idx = add_utf8 ctx.cpb "main" in
-  let main_desc_idx = add_utf8 ctx.cpb "([Ljava/lang/String;)V" in
   let main_method : method_info = {
-    access_flags = acc_public lor acc_static;
-    name_index = main_name_idx;
-    descriptor_index = main_desc_idx;
-    attributes = [main_code_attr];
+    access_flags = (acc_public lor acc_static);
+    name_index = add_utf8 main_cpb "main";
+    descriptor_index = add_utf8 main_cpb "([Ljava/lang/String;)V";
+    attributes = [
+      Code {
+        max_stack = max 2 ctx.max_stack;
+        max_locals = max 1 ctx.next_local; 
+        code = encode_instructions main_instrs;
+        exception_table = [];
+        attributes = [];
+      }
+    ];
   } in
+  
+  let main_bytes = generate_class_file main_cpb acc_public main_class_idx object_class_idx [] [] [main_method] in
 
-  (* Generate methods for extracted functions *)
-  let fn_methods = List.map (generate_function_method ctx.cpb ctx.functions) (List.rev ctx.functions) in
+  (* Generate Interface OnokiFunction *)
+  let interface_bytes = generate_interface_OnokiFunction () in
   
-  (* Build Main class *)
-  let this_class_idx = add_class ctx.cpb "Main" in
-  let super_class_idx = add_class ctx.cpb "java/lang/Object" in
-  
-  let all_methods = main_method :: fn_methods in
-  
-  let class_file = {
-    minor_version = 0;
-    major_version = 50;  (* Java 6 - no stackmap frames required *)
-    constant_pool = ctx.cpb;
-    access_flags = acc_public lor acc_super;
-    this_class = this_class_idx;
-    super_class = super_class_idx;
-    interfaces = [];
-    fields = [];
-    methods = all_methods;
-    attributes = [];
-  } in
-
-  let main_bytes = write_class_file class_file in
-  let interface_bytes = generate_function_interface () in
+  (* Generate List and other runtime classes *)
+  let list_classes = Runtime.generate_runtime_classes () in
   
   (* Generate Module Classes *)
-  let module_classes = List.map (fun (name, decls) -> 
-    generate_module_class name decls ctx.functions ctx.externs
-  ) modules in
-  
+  let rec gen_module_classes path p =
+     List.concat (List.map (function
+       | LModule (name, decls) ->
+           let module_class_entry = generate_module_class (path ^ name) decls ctx.functions ctx.externs in 
+           module_class_entry :: gen_module_classes (path ^ name ^ "$") decls
+       | _ -> []
+     ) p)
+  in
+  let module_classes = gen_module_classes "" prog in
+
   (* Generate Record Classes *)
-  (* Force all fields to be Objects to match gen_lambda assumption *)
+  let records = List.filter_map (function LRecordDef (n, f) -> Some (n, f) | _ -> None) prog in
   let record_classes = List.map (fun (name, fields) ->
     let obj_fields = List.map (fun (n, _) -> (n, "Ljava/lang/Object;")) fields in
     (name ^ ".class", generate_record_class name obj_fields)
   ) records in
+
+  (* Generate Variant Classes *)
+  let variants = List.filter_map (function LVariantDef (n, c) -> Some (LVariantDef (n, c)) | _ -> None) prog in
+  let variant_classes = List.concat (List.map generate_variant_classes variants) in
   
+  let global_closures = !global_closure_list in
+
   [("OnokiFunction.class", interface_bytes);
-   ("Main.class", main_bytes)] @ list_classes @ module_classes @ record_classes @ !global_closure_list
-  
+   ("Main.class", main_bytes)] @ list_classes @ module_classes @ record_classes @ variant_classes @ global_closures

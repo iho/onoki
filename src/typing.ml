@@ -267,6 +267,29 @@ let rec infer_pattern (env : env) (pat : pattern) (expected_ty : ty) : (env * su
              | None -> None)
         | None -> None)
 
+  | PatVariant (name, subpat) ->
+       (match lookup_var env name with
+        | Some scheme -> (
+            let ctor_ty = instantiate scheme in
+            match subpat, ctor_ty with
+             | Some p, TyFun (t_arg, t_ret) ->
+                 (match unify expected_ty t_ret with
+                  | Some s ->
+                      let t_arg' = apply_subst s t_arg in
+                      (* Infer pattern for argument *)
+                      (match infer_pattern env p t_arg' with
+                       | Some (env', s') ->
+                           Some (env', compose_subst s' s)
+                       | None -> None)
+                  | None -> None)
+             | None, _ when not (match ctor_ty with TyFun _ -> true | _ -> false) ->
+                 (* 0-ary pattern *)
+                 (match unify expected_ty ctor_ty with
+                  | Some s -> Some (env, s)
+                  | None -> None)
+             | _ -> None)
+        | None -> None)
+
   | _ -> None (* TODO: other patterns *)
 
 (* Main type inference function *)
@@ -607,8 +630,30 @@ let rec infer (env : env) (expr : expr) : (ty * subst) option =
                    | _ -> None)
               | None -> None))
 
+  (* Variant expression *)
+  | Variant (name, arg_opt) -> (
+      match lookup_var env name with
+      | Some scheme -> (
+          let ctor_ty = instantiate scheme in
+          match arg_opt, ctor_ty with
+          | Some arg, TyFun (t_arg, t_ret) ->
+              (match infer env arg with
+               | Some (t_actual, s) ->
+                   let t_arg' = apply_subst s t_arg in
+                   (match unify t_actual t_arg' with
+                    | Some s_unify ->
+                         let s_final = compose_subst s_unify s in
+                         Some (apply_subst s_final t_ret, s_final)
+                    | None -> None)
+               | None -> None)
+          | None, _ when not (match ctor_ty with TyFun _ -> true | _ -> false) ->
+              (* 0-ary constructor *)
+              Some (ctor_ty, [])
+          | _ -> None (* Argument mismatch *))
+      | None -> None)
+
   (* Other cases - TODO *)
-  | Variant _ | Seq _ -> None
+  | Seq _ -> None
 
 (* Type inference for binary operators *)
 and infer_binop (env : env) (op : binop) (e1 : expr) (e2 : expr) : (ty * subst) option =
@@ -737,15 +782,32 @@ let rec type_check_decl (env : env) (decl : decl) : ((string * binding) * env) o
            let mod_binding = BindModule local_env in
            Some ((name, mod_binding), (name, mod_binding) :: env)
        | None -> None)
-  
+
   | DeclType (name, ty) -> 
-      (* Name the record if it's anonymous *)
+      (* Name the record/variant if it's anonymous *)
       let ty' = match ty with
         | TyRecord (None, fields) -> TyRecord (Some name, fields)
+        | TyVariant (_, ctors) -> TyVariant (name, ctors)
         | _ -> ty
       in
       let binding = BindType ty' in
-      Some ((name, binding), (name, binding) :: env) 
+      
+      let new_env_items = 
+        match ty' with
+        | TyVariant (_, ctors) ->
+            let ctor_bindings = List.map (fun (cname, arg_opt) ->
+              let scheme = match arg_opt with
+                | Some arg_ty -> Forall([], TyFun(arg_ty, ty'))
+                | None -> Forall([], ty')
+              in
+              (cname, BindValue scheme)
+            ) ctors in
+            (name, binding) :: ctor_bindings
+        | _ -> [(name, binding)]
+      in
+      
+      let env' = new_env_items @ env in
+      Some ((name, binding), env') 
 
 (* Initial environment with built-ins *)
 let initial_env : env = [

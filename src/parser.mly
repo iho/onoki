@@ -4,7 +4,7 @@
 
 %token <int> INT
 %token <float> FLOAT
-%token <string> STRING IDENT
+%token <string> STRING LIDENT UIDENT
 %token LET REC IN FUN IF THEN ELSE MATCH WITH TYPE MODULE OPEN EXTERNAL
 %token TRUE FALSE AND OR NOT
 %token LPAREN RPAREN LBRACKET RBRACKET LBRACE RBRACE
@@ -12,6 +12,7 @@
 %token EQ NE LT LE GT GE
 %token ARROW CONS COLON DOT SEMICOLON COMMA PIPE UNDERSCORE
 %token HAT
+%token OF  (* New token for Constructor of Type *)
 %token EOF
 
 %left OR
@@ -33,16 +34,25 @@ prog:
   | decls = list(decl) EOF { decls }
 
 decl:
-  | LET name = IDENT EQ e = expr 
+  | LET name = LIDENT EQ e = expr 
       { DeclLet (name, e) }
-  | LET REC name = IDENT EQ e = expr 
+  | LET REC name = LIDENT EQ e = expr 
       { DeclLetRec (name, e) }
-  | TYPE name = IDENT EQ ty = type_expr
+  | TYPE name = LIDENT EQ ty = type_expr
       { DeclType (name, ty) }
-  | EXTERNAL name = IDENT COLON ty = type_expr EQ impl = STRING
+  | TYPE name = LIDENT EQ constrs = type_variants
+      { DeclType (name, TyVariant (name, constrs)) }
+  | EXTERNAL name = LIDENT COLON ty = type_expr EQ impl = STRING
       { DeclExtern (name, ty, impl) }
-  | MODULE name = IDENT EQ LBRACE decls = list(decl) RBRACE
+  | MODULE name = UIDENT EQ LBRACE decls = list(decl) RBRACE
       { DeclModule (name, decls) }
+
+type_variants:
+  | PIPE? constrs = separated_nonempty_list(PIPE, constructor_decl) { constrs }
+
+constructor_decl:
+  | name = UIDENT { (name, None) }
+  | name = UIDENT OF t = type_expr { (name, Some t) }
 
 expr_top:
   | e = expr EOF { e }
@@ -58,8 +68,10 @@ expr:
       { Bool true }
   | FALSE 
       { Bool false }
-  | x = IDENT 
+  | x = LIDENT 
       { Var x }
+  | c = UIDENT
+      { Variant(c, None) }
 
   | LPAREN e = expr RPAREN 
       { e }
@@ -99,13 +111,15 @@ expr:
       { UnOp (Neg, e) }
   | e1 = expr CONS e2 = expr 
       { Cons (e1, e2) }
-  | FUN params = nonempty_list(IDENT) ARROW body = expr 
+  | FUN params = nonempty_list(LIDENT) ARROW body = expr 
       { List.fold_right (fun p acc -> Fun (p, acc)) params body }
+  | c = UIDENT arg = simple_expr 
+      { Variant (c, Some arg) }
   | e1 = expr e2 = simple_expr 
       { App (e1, e2) }
-  | LET name = IDENT EQ e1 = expr IN e2 = expr 
+  | LET name = LIDENT EQ e1 = expr IN e2 = expr 
       { Let (name, e1, e2) }
-  | LET REC name = IDENT EQ e1 = expr IN e2 = expr 
+  | LET REC name = LIDENT EQ e1 = expr IN e2 = expr 
       { LetRec (name, e1, e2) }
   | IF cond = expr THEN then_ = expr ELSE else_ = expr 
       { If (cond, then_, else_) }
@@ -118,7 +132,7 @@ expr:
         | [] -> Tuple []
         | [e] -> e
         | _ -> Tuple es }
-  | e = expr DOT field = IDENT 
+  | e = expr DOT field = LIDENT 
       { Field (e, field, ref None) }
   | LBRACE fields = separated_list(SEMICOLON, field_binding) RBRACE 
       { Record (ref None, fields) }
@@ -129,7 +143,8 @@ simple_expr:
   | s = STRING { String s }
   | TRUE { Bool true }
   | FALSE { Bool false }
-  | x = IDENT { Var x }
+  | x = LIDENT { Var x }
+  | c = UIDENT { Variant(c, None) }
   | LPAREN es = separated_list(COMMA, expr) RPAREN 
       { match es with
         | [] -> Tuple []
@@ -138,7 +153,7 @@ simple_expr:
   | LBRACKET elems = separated_list(SEMICOLON, expr) RBRACKET { List elems }
 
 field_binding:
-  | name = IDENT EQ e = expr { (name, e) }
+  | name = LIDENT EQ e = expr { (name, e) }
 
 match_cases:
   | PIPE? cases = separated_nonempty_list(PIPE, match_case) { cases }
@@ -147,10 +162,24 @@ match_case:
   | pat = pattern ARROW e = expr { (pat, e) }
 
 pattern:
+  | p1 = constructor_pattern CONS p2 = pattern 
+      { PatCons (p1, p2) }
+  | p = constructor_pattern 
+      { p }
+
+constructor_pattern:
+  | c = UIDENT p = simple_pattern 
+      { PatVariant (c, Some p) }
+  | p = simple_pattern 
+      { p }
+
+simple_pattern:
   | i = INT 
       { PatInt i }
-  | x = IDENT 
+  | x = LIDENT 
       { PatVar x }
+  | c = UIDENT
+      { PatVariant (c, None) }
   | UNDERSCORE 
       { PatWildcard }
   | LPAREN pats = separated_list(COMMA, pattern) RPAREN 
@@ -160,13 +189,11 @@ pattern:
         | _ -> PatTuple pats }
   | LBRACKET pats = separated_list(SEMICOLON, pattern) RBRACKET
       { PatList pats }
-  | p1 = pattern CONS p2 = pattern 
-      { PatCons (p1, p2) }
   | LBRACE fields = separated_list(SEMICOLON, pattern_field) RBRACE 
       { PatRecord fields }
 
 pattern_field:
-  | name = IDENT EQ pat = pattern { (name, pat) }
+  | name = LIDENT EQ pat = pattern { (name, pat) }
 
 type_expr:
   | t1 = type_expr ARROW t2 = type_expr 
@@ -175,7 +202,7 @@ type_expr:
       { t }
 
 type_simple:
-  | name = IDENT 
+  | name = LIDENT 
       { match name with
         | "int" -> TyInt
         | "float" -> TyFloat
@@ -183,7 +210,7 @@ type_simple:
         | "string" -> TyString
         | "unit" -> TyTuple []
         | _ -> TyVar name }
-  | type_simple IDENT
+  | type_simple LIDENT (* list type application *)
       { match $2 with
         | "list" -> TyList $1
         | _ -> failwith "Only list type constructor supported" }
@@ -195,5 +222,5 @@ type_simple:
       { TyRecord (None, fields) }
 
 type_field:
-  | name = IDENT COLON t = type_expr { (name, t) }
+  | name = LIDENT COLON t = type_expr { (name, t) }
 
