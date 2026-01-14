@@ -11,6 +11,7 @@ type ty_scheme = Forall of string list * ty
 type binding =
   | BindValue of ty_scheme
   | BindModule of env
+  | BindType of ty
 
 and env = (string * binding) list
 
@@ -37,8 +38,8 @@ let rec apply_subst (s : subst) (t : ty) : ty =
   | TyVariant (name, ctors) ->
       TyVariant (name, List.map (fun (n, opt_t) ->
         (n, Option.map (apply_subst s) opt_t)) ctors)
-  | TyRecord fields ->
-      TyRecord (List.map (fun (n, t) -> (n, apply_subst s t)) fields)
+  | TyRecord (name, fields) ->
+      TyRecord (name, List.map (fun (n, t) -> (n, apply_subst s t)) fields)
   | _ -> t
 
 (* Apply substitution to a type scheme *)
@@ -52,6 +53,7 @@ let rec apply_subst_binding (s : subst) (b : binding) : binding =
   match b with
   | BindValue scheme -> BindValue (apply_subst_scheme s scheme)
   | BindModule env -> BindModule (List.map (fun (n, b) -> (n, apply_subst_binding s b)) env)
+  | BindType ty -> BindType (apply_subst s ty)
 
 (* Compose two substitutions *)
 let compose_subst (s1 : subst) (s2 : subst) : subst =
@@ -68,7 +70,7 @@ let rec occurs (v : string) (t : ty) : bool =
   | TyVariant (_, ctors) ->
       List.exists (fun (_, opt_t) ->
         match opt_t with Some t -> occurs v t | None -> false) ctors
-  | TyRecord fields ->
+  | TyRecord (_, fields) ->
       List.exists (fun (_, t) -> occurs v t) fields
   | _ -> false
 
@@ -108,7 +110,7 @@ let rec unify (t1 : ty) (t2 : ty) : subst option =
       Some []  (* TODO: proper variant unification *)
   
   (* Record types *)
-  | TyRecord fields1, TyRecord fields2 when List.length fields1 = List.length fields2 ->
+  | TyRecord (_, fields1), TyRecord (_, fields2) when List.length fields1 = List.length fields2 ->
       (* TODO: proper record unification *)
       Some []
   
@@ -138,7 +140,7 @@ let free_vars_ty (t : ty) : string list =
     | TyVariant (_, ctors) ->
         List.fold_left (fun acc (_, opt_t) ->
           match opt_t with Some t -> go acc t | None -> acc) acc ctors
-    | TyRecord fields ->
+    | TyRecord (_, fields) ->
         List.fold_left (fun acc (_, t) -> go acc t) acc fields
     | _ -> acc
   in go [] t
@@ -150,6 +152,7 @@ let rec free_vars_binding (b : binding) : string list =
       let fv = free_vars_ty t in
       List.filter (fun v -> not (List.mem v vars)) fv
   | BindModule env -> free_vars_env env
+  | BindType ty -> free_vars_ty ty
 
 (* Free type variables in an environment *)
 and free_vars_env (env : env) : string list =
@@ -496,8 +499,116 @@ let rec infer (env : env) (expr : expr) : (ty * subst) option =
            check_cases s_scr cases
        | None -> None)
 
+  (* Record construction *)
+  | Record (name_ref, fields) ->
+       (* 1. Infer types of all fields *)
+       let rec infer_fields env acc_subst acc_types = function
+         | [] -> Some (List.rev acc_types, acc_subst)
+         | (n, e) :: rest ->
+             let env' = List.map (fun (v, binding) ->
+               (v, apply_subst_binding acc_subst binding)) env in
+             (match infer env' e with
+              | Some (t, s) ->
+                  let s' = compose_subst s acc_subst in
+                  infer_fields env s' ((n, t) :: acc_types) rest
+              | None -> None)
+       in
+       (match infer_fields env [] [] fields with
+        | Some (inferred_fields, s) ->
+            (* 2. Find matching record definition *)
+            let field_names = List.map fst fields in
+            let sorted_names = List.sort String.compare field_names in
+            
+            let found_type = List.find_map (fun (_name, binding) ->
+              match binding with
+              | BindType (TyRecord (Some rec_name, def_fields)) ->
+                  let def_names = List.map fst def_fields in
+                  let sorted_def = List.sort String.compare def_names in
+                  if sorted_names = sorted_def then 
+                    (* We return the type with its name, so we found it *)
+                    Some (TyRecord (Some rec_name, def_fields))
+                  else None
+              | _ -> None
+            ) env in
+            
+            (match found_type with
+             | Some (TyRecord (Some rec_name, def_fields)) ->
+                 name_ref := Some rec_name;
+                 (* 3. Unify inferred fields with definition fields *)
+                 let rec check_fields acc_subst = function
+                   | [] -> Some (TyRecord (Some rec_name, def_fields), acc_subst)
+                   | (n, t) :: rest ->
+                       let def_ty = List.assoc n def_fields in
+                       let def_ty' = apply_subst acc_subst def_ty in (* Should instantiate? simple for now *)
+                       (match unify t def_ty' with
+                        | Some s_unify ->
+                            let s_next = compose_subst s_unify acc_subst in
+                            check_fields s_next rest
+                        | None -> None)
+                 in
+                 check_fields s inferred_fields
+             | _ -> None) (* No matching record type found *)
+        | None -> None)
+
+  (* Field access *)
+  | Field (e, field, class_ref) ->
+       (* Helper to resolve module path *)
+       let rec resolve_module_path e =
+         match e with
+         | Var m -> (
+             match List.assoc_opt m env with
+             | Some (BindModule mod_env) -> Some mod_env
+             | _ -> None)
+         | Field (sub, name, _) -> (
+             match resolve_module_path sub with
+             | Some mod_env -> (
+                 match List.assoc_opt name mod_env with
+                 | Some (BindModule sub_env) -> Some sub_env
+                 | _ -> None)
+             | None -> None)
+         | _ -> None
+       in
+       
+       let module_access = 
+         match resolve_module_path e with
+         | Some mod_env -> 
+             (* Look up value in module *)
+             (match List.assoc_opt field mod_env with
+              | Some (BindValue scheme) -> Some (instantiate scheme, [])
+              | _ -> None)
+         | None -> None
+       in
+       
+       (match module_access with
+        | Some res -> Some res
+        | None ->
+             (* Standard Record Field Access *)
+             (match infer env e with
+              | Some (t_e, s) ->
+                  (* Find record definition *)
+                  let candidates = List.filter_map (fun (_name, binding) ->
+                    match binding with
+                    | BindType (TyRecord (Some rec_name, def_fields)) ->
+                        if List.mem_assoc field def_fields then 
+                          Some (rec_name, List.assoc field def_fields, TyRecord (Some rec_name, def_fields))
+                        else None
+                    | _ -> None
+                  ) env in
+                  
+                  (match candidates with
+                   | [(rec_name, field_ty, rec_ty)] ->
+                       class_ref := Some rec_name;
+                       (match unify t_e rec_ty with
+                        | Some s_unify ->
+                            let s_final = compose_subst s_unify s in
+                            Some (apply_subst s_final field_ty, s_final)
+                        | None -> None)
+                   | [] -> None
+                   | _ -> None)
+              | None -> None))
+
   (* Other cases - TODO *)
-  | Variant _ | Record _ | Field _ | Seq _ -> None
+  | Variant _ | Seq _ -> None
 
 (* Type inference for binary operators *)
 and infer_binop (env : env) (op : binop) (e1 : expr) (e2 : expr) : (ty * subst) option =
@@ -627,9 +738,14 @@ let rec type_check_decl (env : env) (decl : decl) : ((string * binding) * env) o
            Some ((name, mod_binding), (name, mod_binding) :: env)
        | None -> None)
   
-  | DeclType _ -> 
-       (* Types are handled separately or during resolution, ignoring for now *)
-       Some (("", BindValue (Forall([], TyTuple[]))), env) 
+  | DeclType (name, ty) -> 
+      (* Name the record if it's anonymous *)
+      let ty' = match ty with
+        | TyRecord (None, fields) -> TyRecord (Some name, fields)
+        | _ -> ty
+      in
+      let binding = BindType ty' in
+      Some ((name, binding), (name, binding) :: env) 
 
 (* Initial environment with built-ins *)
 let initial_env : env = [

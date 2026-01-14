@@ -13,10 +13,19 @@ type instruction =
   | Iload_0 | Iload_1 | Iload_2 | Iload_3
   | Aload of int
   | Aload_0 | Aload_1 | Aload_2 | Aload_3
+  | Fload of int
+  | Fload_0 | Fload_1 | Fload_2 | Fload_3
+  | Dload of int
+  | Dload_0 | Dload_1 | Dload_2 | Dload_3
+  
   | Istore of int
   | Istore_0 | Istore_1 | Istore_2 | Istore_3
   | Astore of int
   | Astore_0 | Astore_1 | Astore_2 | Astore_3
+  | Fstore of int
+  | Fstore_0 | Fstore_1 | Fstore_2 | Fstore_3
+  | Dstore of int
+  | Dstore_0 | Dstore_1 | Dstore_2 | Dstore_3
   
   (* Stack manipulation *)
   | Pop
@@ -121,6 +130,16 @@ let encode_instruction (instr : instruction) : bytes =
    | Aload_1 -> add_u1 0x2b
    | Aload_2 -> add_u1 0x2c
    | Aload_3 -> add_u1 0x2d
+   | Fload n -> add_u1 0x17; add_u1 n
+   | Fload_0 -> add_u1 0x22
+   | Fload_1 -> add_u1 0x23
+   | Fload_2 -> add_u1 0x24
+   | Fload_3 -> add_u1 0x25
+   | Dload n -> add_u1 0x18; add_u1 n
+   | Dload_0 -> add_u1 0x26
+   | Dload_1 -> add_u1 0x27
+   | Dload_2 -> add_u1 0x28
+   | Dload_3 -> add_u1 0x29
    
    (* Store *)
    | Istore n -> add_u1 0x36; add_u1 n
@@ -133,6 +152,16 @@ let encode_instruction (instr : instruction) : bytes =
    | Astore_1 -> add_u1 0x4c
    | Astore_2 -> add_u1 0x4d
    | Astore_3 -> add_u1 0x4e
+   | Fstore n -> add_u1 0x38; add_u1 n
+   | Fstore_0 -> add_u1 0x43
+   | Fstore_1 -> add_u1 0x44
+   | Fstore_2 -> add_u1 0x45
+   | Fstore_3 -> add_u1 0x46
+   | Dstore n -> add_u1 0x39; add_u1 n
+   | Dstore_0 -> add_u1 0x47
+   | Dstore_1 -> add_u1 0x48
+   | Dstore_2 -> add_u1 0x49
+   | Dstore_3 -> add_u1 0x4a
    
    (* Stack *)
    | Pop -> add_u1 0x57

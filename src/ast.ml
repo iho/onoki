@@ -10,7 +10,7 @@ type ty =
   | TyTuple of ty list
   | TyList of ty
   | TyVariant of string * (string * ty option) list
-  | TyRecord of (string * ty) list
+  | TyRecord of string option * (string * ty) list
   [@@deriving show, eq]
 
 type binop = 
@@ -42,8 +42,8 @@ type expr =
   | List of expr list
   | Cons of expr * expr
   | Variant of string * expr option
-  | Record of (string * expr) list
-  | Field of expr * string
+  | Record of string option ref * (string * expr) list
+  | Field of expr * string * string option ref
   | Seq of expr list
   [@@deriving show, eq]
 

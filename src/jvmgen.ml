@@ -98,12 +98,18 @@ let update_stack_depth (ctx : codegen_ctx) (instr : instruction) : unit =
     | Bipush _ | Sipush _ | Ldc _ | Ldc_w _
     | Iload _ | Iload_0 | Iload_1 | Iload_2 | Iload_3
     | Aload _ | Aload_0 | Aload_1 | Aload_2 | Aload_3
+    | Fload _ | Fload_0 | Fload_1 | Fload_2 | Fload_3
     | Dup -> 1
+    | Dload _ | Dload_0 | Dload_1 | Dload_2 | Dload_3
+    | Dup2 -> 2
     
     (* Pop 1 *)
     | Istore _ | Istore_0 | Istore_1 | Istore_2 | Istore_3
     | Astore _ | Astore_0 | Astore_1 | Astore_2 | Astore_3
+    | Fstore _ | Fstore_0 | Fstore_1 | Fstore_2 | Fstore_3
     | Pop | Ifeq _ | Ifne _ | Iflt _ | Ifle _ | Ifgt _ | Ifge _ -> -1
+    
+    | Dstore _ | Dstore_0 | Dstore_1 | Dstore_2 | Dstore_3 -> -2
     
     (* Pop 2, push 1 *)
     | Iadd | Isub | Imul | Idiv | Irem
@@ -470,6 +476,19 @@ let rec gen_lambda (ctx : codegen_ctx) (expr : lambda) : unit =
         emit ctx (Astore slot);
       gen_lambda ctx e2
 
+  | LApp (LVar "println", [arg]) ->
+      let print_stream_idx = add_fieldref ctx.cpb "java/lang/System" "out" "Ljava/io/PrintStream;" in
+      let println_idx = add_methodref ctx.cpb "java/io/PrintStream" "println" "(Ljava/lang/Object;)V" in
+      emit ctx (Getstatic print_stream_idx);
+      gen_lambda ctx arg;
+      (* Ensure object (boxing) *)
+      let obj_idx = add_class ctx.cpb "java/lang/Object" in
+      emit ctx (Checkcast obj_idx);
+      emit ctx (Invokevirtual println_idx);
+      (* Return unit/nil *)
+      let nil_idx = add_fieldref ctx.cpb "OnokiNil" "INSTANCE" "LOnokiNil;" in
+      emit ctx (Getstatic nil_idx)
+
   | LApp (LVar "failwith", [msg]) ->
       gen_lambda ctx msg;
       (* Create RuntimeException *)
@@ -706,6 +725,30 @@ let rec gen_lambda (ctx : codegen_ctx) (expr : lambda) : unit =
       let init_idx = add_methodref ctx.cpb class_name "<init>" init_desc in
       emit ctx (Invokespecial init_idx)
 
+
+  | LNewRecord (name, args) ->
+       let class_idx = add_class ctx.cpb name in
+       emit ctx (New class_idx);
+       emit ctx Dup;
+       (* Args *)
+       List.iter (fun arg -> 
+         gen_lambda ctx arg;
+         (* Checkcast Object to match generate_record_class assumption *)
+         let obj_idx = add_class ctx.cpb "java/lang/Object" in 
+         emit ctx (Checkcast obj_idx) 
+       ) args;
+       
+       let sig_args = String.concat "" (List.map (fun _ -> "Ljava/lang/Object;") args) in
+       let init_sig = "(" ^ sig_args ^ ")V" in
+       let init_idx = add_methodref ctx.cpb name "<init>" init_sig in
+       emit ctx (Invokespecial init_idx)
+
+  | LGetField (e, cls, f) ->
+       gen_lambda ctx e;
+       let cls_idx = add_class ctx.cpb cls in
+       emit ctx (Checkcast cls_idx);
+       let field_ref = add_fieldref ctx.cpb cls f "Ljava/lang/Object;" in
+       emit ctx (Getfield field_ref)
 
   | stmt ->
       failwith ("Unsupported Lambda form in codegen: " ^ (show_lambda stmt))
@@ -1220,6 +1263,89 @@ let generate_module_class (name : string) (decls : lambda list) (functions: func
   } in
   (name ^ ".class", write_class_file class_file)
 
+(* Generate POJO for Record *)
+and generate_record_class (name : string) (fields : (string * string) list) : bytes =
+  let cpb = create_cp_builder () in
+  let this_idx = add_class cpb name in
+  let super_idx = add_class cpb "java/lang/Object" in
+  
+  (* Fields *)
+  let field_infos = List.map (fun (fname, desc) ->
+    let name_idx = add_utf8 cpb fname in
+    let desc_idx = add_utf8 cpb desc in
+    { access_flags = acc_public; name_index = name_idx; descriptor_index = desc_idx; attributes = [] }
+  ) fields in
+  
+  (* Constructor (args...)V *)
+  let init_sig = "(" ^ (String.concat "" (List.map snd fields)) ^ ")V" in
+  let init_name_idx = add_utf8 cpb "<init>" in
+  let init_desc_idx = add_utf8 cpb init_sig in
+  
+  let ctx = create_context () in
+  ctx.cpb <- cpb;
+  ctx.next_local <- 1; (* this *)
+  (* Allocate locals for args *)
+  List.iter (fun _ -> ctx.next_local <- ctx.next_local + 1) fields; (* Assuming 1 slot per arg *)
+  
+  emit ctx Aload_0;
+  let super_init = add_methodref cpb "java/lang/Object" "<init>" "()V" in
+  emit ctx (Invokespecial super_init);
+  
+  (* Assign fields *)
+  List.iteri (fun i (fname, desc) ->
+     emit ctx Aload_0;
+     let arg_idx = i + 1 in
+     (match desc with
+      | "I" | "Z" -> 
+         if arg_idx <= 3 then 
+           emit ctx (match arg_idx with 1 -> Iload_1 | 2 -> Iload_2 | 3 -> Iload_3 | _ -> failwith "imp")
+         else emit ctx (Iload arg_idx)
+      | "F" -> 
+         if arg_idx <= 3 then
+            emit ctx (match arg_idx with 1 -> Fload_1 | 2 -> Fload_2 | 3 -> Fload_3 | _ -> failwith "imp")
+         else emit ctx (Fload arg_idx)
+      | _ -> 
+         if arg_idx <= 3 then
+            emit ctx (match arg_idx with 1 -> Aload_1 | 2 -> Aload_2 | 3 -> Aload_3 | _ -> failwith "imp")
+         else emit ctx (Aload arg_idx));
+      
+     let f_ref = add_fieldref cpb name fname desc in
+     emit ctx (Putfield f_ref)
+  ) fields;
+  
+  emit ctx Return;
+  
+  let init_code = encode_instructions ctx.instructions in 
+  let _code_name_idx = add_utf8 cpb "Code" in
+  let init_code_attr = Code {
+    max_stack = 2; (* this, arg *)
+    max_locals = ctx.next_local;
+    code = init_code;
+    exception_table = [];
+    attributes = [];
+  } in
+  
+  let init_method : method_info = {
+    access_flags = acc_public;
+    name_index = init_name_idx;
+    descriptor_index = init_desc_idx;
+    attributes = [init_code_attr];
+  } in
+  
+  let class_file = {
+    minor_version = 0;
+    major_version = 50;
+    constant_pool = cpb;
+    access_flags = acc_public lor acc_super;
+    this_class = this_idx;
+    super_class = super_idx;
+    interfaces = [];
+    fields = field_infos;
+    methods = [init_method];
+    attributes = [];
+  } in
+  write_class_file class_file
+
 (* Generate all classes *)
 let generate_classes (prog : lambda list) : (string * bytes) list =
   (* 1. Generate Main class *)
@@ -1234,14 +1360,20 @@ let generate_classes (prog : lambda list) : (string * bytes) list =
   (* Reserve local 0 for 'args' parameter *)
   ctx.next_local <- 1;
   
-  (* Separate modules from main program *)
+  (* Separate modules and records from main program *)
   let modules = List.filter_map (function
     | LModule (name, decls) -> Some (name, decls)
     | _ -> None
   ) prog in
   
+  let records = List.filter_map (function
+    | LRecordDef (name, fields) -> Some (name, fields)
+    | _ -> None
+  ) prog in
+  
   let main_prog = List.filter (function
     | LModule _ -> false
+    | LRecordDef _ -> false
     | _ -> true
   ) prog in
 
@@ -1325,6 +1457,13 @@ let generate_classes (prog : lambda list) : (string * bytes) list =
     generate_module_class name decls ctx.functions ctx.externs
   ) modules in
   
+  (* Generate Record Classes *)
+  (* Force all fields to be Objects to match gen_lambda assumption *)
+  let record_classes = List.map (fun (name, fields) ->
+    let obj_fields = List.map (fun (n, _) -> (n, "Ljava/lang/Object;")) fields in
+    (name ^ ".class", generate_record_class name obj_fields)
+  ) records in
+  
   [("OnokiFunction.class", interface_bytes);
-   ("Main.class", main_bytes)] @ list_classes @ module_classes @ !global_closure_list
+   ("Main.class", main_bytes)] @ list_classes @ module_classes @ record_classes @ !global_closure_list
   

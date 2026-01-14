@@ -16,6 +16,9 @@ type lambda =
   | LTry of lambda * (string * lambda)
   | LExtern of string * string
   | LModule of string * lambda list
+  | LRecordDef of string * (string * string) list (* Name, (Field, Descriptor) *)
+  | LNewRecord of string * lambda list (* Name, Args *)
+  | LGetField of lambda * string * string (* Expr, Class, Field *)
 
 and constant =
   | CInt of int
@@ -84,6 +87,22 @@ let rec show_lambda = function
   | LModule (name, decls) ->
       Printf.sprintf "(module %s {\n%s\n})" name
         (String.concat "\n" (List.map show_lambda decls))
+  | LRecordDef (name, fields) ->
+      let show_field (n, t) = Printf.sprintf "%s:%s" n t in
+      Printf.sprintf "(record %s { %s })" name (String.concat "; " (List.map show_field fields))
+  | LNewRecord (name, args) ->
+      Printf.sprintf "(new %s %s)" name (String.concat " " (List.map show_lambda args))
+  | LGetField (e, cls, f) ->
+      Printf.sprintf "%s.%s::%s" (show_lambda e) cls f
+
+(* Lowering type to JVM descriptor *)
+let lower_type : ty -> string = function
+  | TyInt -> "I"
+  | TyFloat -> "F"
+  | TyBool | TyString | TyList _ | TyTuple _ | TyFun _ | TyVar _ -> "Ljava/lang/Object;" (* Boxed/Unknown *)
+  | TyRecord (Some name, _) -> "L" ^ name ^ ";" 
+  | TyRecord (None, _) -> "Ljava/lang/Object;" 
+  | TyVariant (name, _) -> "L" ^ name ^ ";"
 
 (* Lowering from typed AST to Lambda form *)
 let rec lower_expr : expr -> lambda = function
@@ -107,7 +126,7 @@ let rec lower_expr : expr -> lambda = function
         | Ge -> "__ge"
         | And -> "__and"
         | Or -> "__or"
-        | Concat -> "^" (* Concat matches ^ token, usually safe *)
+        | Concat -> "^"
       in
       LApp (LVar op_name, [lower_expr e1; lower_expr e2])
   | UnOp (op, e) ->
@@ -127,7 +146,6 @@ let rec lower_expr : expr -> lambda = function
       LIf (lower_expr cond, lower_expr then_, lower_expr else_)
   | Tuple exprs -> LTuple (List.map lower_expr exprs)
   | List exprs ->
-      (* Build list as nested cons operations *)
       List.fold_right
         (fun e acc -> LApp (LVar "cons", [lower_expr e; acc]))
         exprs
@@ -136,22 +154,45 @@ let rec lower_expr : expr -> lambda = function
       LApp (LVar "cons", [lower_expr e1; lower_expr e2])
   | Match (scrutinee, cases) ->
       compile_match (lower_expr scrutinee) cases
-  | Field (e, _field) ->
-      (* TODO: track field positions *)
-      LField (lower_expr e, 0)
-  | Record fields ->
-      LTuple (List.map (fun (_, e) -> lower_expr e) fields)
+  | Field (e, field, class_ref) ->
+      (* Use captured class name from type checker if available *)
+      (match !class_ref with
+       | Some cls -> LGetField (lower_expr e, cls, field)
+       | None -> 
+           (* Fallback for tests/untyped paths or structural? *)
+           (* Or maybe it's tuple access? TODO *)
+           LField (lower_expr e, 0))
+  | Record (name_ref, fields) ->
+       (match !name_ref with
+        | Some name ->
+            (* Generate new Name(args) *)
+            (* Assumption: AST fields are in definition order? No. *)
+            (* POJO constructor usually takes args in def order? *)
+            (* Or setters? *)
+            (* Implementation Plan assumption: POJO with constructor (x, y) *)
+            (* I need to sort fields or lookup definition to know order! *)
+            (* But 'lower' doesn't have env. *)
+            (* Hack: sort fields by name? If definition is sorted? *)
+            (* In 'typing.ml', unification sorted names? *)
+            (* Standard Java tooling sorts? No. *)
+            (* I MUST ensure constructor arg order matches. *)
+            (* FOR NOW: sort by name alphabet. *)
+            let sorted_fields = List.sort (fun (a,_) (b,_) -> String.compare a b) fields in
+            let args = List.map (fun (_, e) -> lower_expr e) sorted_fields in
+            LNewRecord (name, args)
+        | None -> 
+            LTuple (List.map (fun (_, e) -> lower_expr e) fields))
   | Variant (name, opt_expr) ->
-      (* TODO: proper variant encoding *)
       (match opt_expr with
        | None -> LVar name
        | Some e -> LApp (LVar name, [lower_expr e]))
   | Seq exprs ->
-      (* Sequence as nested let bindings *)
       List.fold_right
         (fun e acc -> LLet ("_", lower_expr e, acc))
         (List.rev (List.tl (List.rev exprs)))
         (lower_expr (List.hd (List.rev exprs)))
+
+(* ... compile_match ... *)
 
 (* Pattern matching compilation to decision trees *)
 and compile_match scrutinee cases : lambda =
@@ -176,18 +217,10 @@ and compile_match scrutinee cases : lambda =
           | [] -> next
           | p :: rest ->
               let field_val = LField (scr, i) in
-              (* Note: fail code is duplicated here. In a production compiler, 
-                 we would use a join point (function) for failure. *)
               compile_pattern field_val p (match_fields (i + 1) rest) fail
         in
         match_fields 0 pats
     | PatCons (p1, p2) ->
-        (* Check if list is non-empty cell *)
-        (* Assuming runtime has is_empty or similar, or checking against Nil *)
-        (* For now, using OnokiCons check. But we only have primitives.
-           Let's assume we can check if it conforms to Cons. 
-           Actually, primitives are: head, tail, is_empty.
-           is_empty checks if it is Nil. *)
         LIf (LApp (LVar "is_empty", [scr]),
              fail,
              let head_val = LApp (LVar "head", [scr]) in
@@ -199,10 +232,8 @@ and compile_match scrutinee cases : lambda =
         let rec match_list_pats (s : lambda) (ps : pattern list) : lambda =
           match ps with
           | [] -> 
-              (* Check empty *)
               LIf (LApp (LVar "is_empty", [s]), next, fail)
           | p :: rest ->
-               (* Check not empty *)
                LIf (LApp (LVar "is_empty", [s]),
                     fail,
                     let head_val = LApp (LVar "head", [s]) in
@@ -222,8 +253,6 @@ and compile_match scrutinee cases : lambda =
     | [] -> LApp (LVar "failwith", [LConst (CString "Match failed")])
     | (pat, body) :: rest ->
         let fail_code = build_cases rest in
-        (* Optimization: if pat is catch-all, don't generate fail code for this branch *)
-        (* But compile_pattern generates it. *)
         compile_pattern scrutinee_ref pat (lower_expr body) fail_code
   in
   
@@ -235,5 +264,13 @@ let rec lower_program : program -> lambda list = fun decls ->
     | DeclLetRec (name, e) -> LLetRec ([(name, lower_expr e)], LVar name)
     | DeclExtern (name, _ty, impl) -> LExtern (name, impl)
     | DeclModule (name, subdecls) -> LModule (name, lower_program subdecls)
-    | _ -> failwith "TODO: other declarations"
+    | DeclType (name, TyRecord (_, fields)) ->
+         (* Generate record definition *)
+         (* Convert field types to descriptors *)
+         (* Assuming definition fields are types. *)
+         (* Sort by name? Yes, to match Constructor assumption. *)
+         let sorted_fields = List.sort (fun (a,_) (b,_) -> String.compare a b) fields in
+         let desc_fields = List.map (fun (n, t) -> (n, lower_type t)) sorted_fields in
+         LRecordDef (name, desc_fields)
+    | DeclType _ -> LTuple [] (* Ignore other types *)
   ) decls

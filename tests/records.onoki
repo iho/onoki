@@ -1,0 +1,14 @@
+
+type Point = { x: int; y: int }
+
+let p = { x = 10; y = 20 }
+let x_val = p.x
+let y_val = p.y
+
+type Rect = { tl: Point; br: Point }
+let r = { tl = p; br = { x = 30; y = 40 } }
+let tl_x = r.tl.x
+
+let d1 = println(x_val) (* 10 *)
+let d2 = println(y_val) (* 20 *)
+let d3 = println(tl_x) (* 10 *)

@@ -39,6 +39,8 @@ let () =
                Printf.printf "✓ %s : %s\n" name (Onoki_lib.Ast.show_ty ty)
            | Onoki_lib.Typing.BindModule _ ->
                Printf.printf "✓ module %s\n" name
+           | Onoki_lib.Typing.BindType ty ->
+               Printf.printf "✓ type %s = %s\n" name (Onoki_lib.Ast.show_ty ty)
          ) bindings;
          Printf.printf "\n"
      | None ->

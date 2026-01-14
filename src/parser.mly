@@ -60,8 +60,7 @@ expr:
       { Bool false }
   | x = IDENT 
       { Var x }
-  | m = IDENT DOT x = IDENT
-      { Var (m ^ "." ^ x) }
+
   | LPAREN e = expr RPAREN 
       { e }
   | LPAREN RPAREN
@@ -120,9 +119,9 @@ expr:
         | [e] -> e
         | _ -> Tuple es }
   | e = expr DOT field = IDENT 
-      { Field (e, field) }
+      { Field (e, field, ref None) }
   | LBRACE fields = separated_list(SEMICOLON, field_binding) RBRACE 
-      { Record fields }
+      { Record (ref None, fields) }
 
 simple_expr:
   | i = INT { Int i }
@@ -192,4 +191,9 @@ type_simple:
       { t }
   | LPAREN ts = separated_nonempty_list(COMMA, type_expr) RPAREN
       { TyTuple ts }
+  | LBRACE fields = separated_list(SEMICOLON, type_field) RBRACE
+      { TyRecord (None, fields) }
+
+type_field:
+  | name = IDENT COLON t = type_expr { (name, t) }
 
