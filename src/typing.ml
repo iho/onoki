@@ -1,107 +1,460 @@
-(* Type inference engine for Onoki *)
+(* Type inference engine for Onoki - Hindley-Milner Algorithm W *)
 open Ast
 
-type env = (string * ty) list
+(* Type substitution *)
+type subst = (string * ty) list
 
+(* Type schemes for polymorphism *)
+type ty_scheme = Forall of string list * ty
+
+(* Type environment *)
+type env = (string * ty_scheme) list
+
+(* Fresh type variable counter *)
 let fresh_var_counter = ref 0
 
 let fresh_var () =
   incr fresh_var_counter;
-  Printf.sprintf "t%d" !fresh_var_counter
+  Printf.sprintf "'t%d" !fresh_var_counter
 
-(* Simple type inference - will be extended with proper unification *)
-let rec infer (env : env) (expr : expr) : ty option =
+let reset_fresh_vars () =
+  fresh_var_counter := 0
+
+(* Apply substitution to a type *)
+let rec apply_subst (s : subst) (t : ty) : ty =
+  match t with
+  | TyVar v -> (
+      match List.assoc_opt v s with
+      | Some t' -> apply_subst s t'  (* Follow substitution chains *)
+      | None -> t)
+  | TyFun (t1, t2) -> TyFun (apply_subst s t1, apply_subst s t2)
+  | TyTuple ts -> TyTuple (List.map (apply_subst s) ts)
+  | TyList t -> TyList (apply_subst s t)
+  | TyVariant (name, ctors) ->
+      TyVariant (name, List.map (fun (n, opt_t) ->
+        (n, Option.map (apply_subst s) opt_t)) ctors)
+  | TyRecord fields ->
+      TyRecord (List.map (fun (n, t) -> (n, apply_subst s t)) fields)
+  | _ -> t
+
+(* Apply substitution to a type scheme *)
+let apply_subst_scheme (s : subst) (Forall (vars, t) : ty_scheme) : ty_scheme =
+  (* Remove bindings for quantified variables *)
+  let s' = List.filter (fun (v, _) -> not (List.mem v vars)) s in
+  Forall (vars, apply_subst s' t)
+
+(* Compose two substitutions *)
+let compose_subst (s1 : subst) (s2 : subst) : subst =
+  (* Apply s1 to all types in s2, then append s1 *)
+  List.map (fun (v, t) -> (v, apply_subst s1 t)) s2 @ s1
+
+(* Occurs check - prevents infinite types *)
+let rec occurs (v : string) (t : ty) : bool =
+  match t with
+  | TyVar v' -> v = v'
+  | TyFun (t1, t2) -> occurs v t1 || occurs v t2
+  | TyTuple ts -> List.exists (occurs v) ts
+  | TyList t -> occurs v t
+  | TyVariant (_, ctors) ->
+      List.exists (fun (_, opt_t) ->
+        match opt_t with Some t -> occurs v t | None -> false) ctors
+  | TyRecord fields ->
+      List.exists (fun (_, t) -> occurs v t) fields
+  | _ -> false
+
+(* Unification algorithm *)
+let rec unify (t1 : ty) (t2 : ty) : subst option =
+  match t1, t2 with
+  (* Base types *)
+  | TyInt, TyInt | TyFloat, TyFloat | TyString, TyString | TyBool, TyBool ->
+      Some []
+  
+  (* Type variables *)
+  | TyVar v1, TyVar v2 when v1 = v2 -> Some []
+  | TyVar v, t | t, TyVar v ->
+      if occurs v t then None  (* Occurs check *)
+      else Some [(v, t)]
+  
+  (* Function types *)
+  | TyFun (a1, r1), TyFun (a2, r2) -> (
+      match unify a1 a2 with
+      | None -> None
+      | Some s1 ->
+          let r1' = apply_subst s1 r1 in
+          let r2' = apply_subst s1 r2 in
+          (match unify r1' r2' with
+           | None -> None
+           | Some s2 -> Some (compose_subst s2 s1)))
+  
+  (* Tuple types *)
+  | TyTuple ts1, TyTuple ts2 when List.length ts1 = List.length ts2 ->
+      unify_list ts1 ts2
+  
+  (* List types *)
+  | TyList t1, TyList t2 -> unify t1 t2
+  
+  (* Variant types *)
+  | TyVariant (n1, _), TyVariant (n2, _) when n1 = n2 ->
+      Some []  (* TODO: proper variant unification *)
+  
+  (* Record types *)
+  | TyRecord fields1, TyRecord fields2 when List.length fields1 = List.length fields2 ->
+      (* TODO: proper record unification *)
+      Some []
+  
+  | _ -> None
+
+and unify_list (ts1 : ty list) (ts2 : ty list) : subst option =
+  match ts1, ts2 with
+  | [], [] -> Some []
+  | t1 :: ts1', t2 :: ts2' -> (
+      match unify t1 t2 with
+      | None -> None
+      | Some s1 ->
+          let ts1'' = List.map (apply_subst s1) ts1' in
+          let ts2'' = List.map (apply_subst s1) ts2' in
+          (match unify_list ts1'' ts2'' with
+           | None -> None
+           | Some s2 -> Some (compose_subst s2 s1)))
+  | _ -> None
+
+(* Free type variables in a type *)
+let free_vars_ty (t : ty) : string list =
+  let rec go acc = function
+    | TyVar v -> if List.mem v acc then acc else v :: acc
+    | TyFun (t1, t2) -> go (go acc t1) t2
+    | TyTuple ts -> List.fold_left go acc ts
+    | TyList t -> go acc t
+    | TyVariant (_, ctors) ->
+        List.fold_left (fun acc (_, opt_t) ->
+          match opt_t with Some t -> go acc t | None -> acc) acc ctors
+    | TyRecord fields ->
+        List.fold_left (fun acc (_, t) -> go acc t) acc fields
+    | _ -> acc
+  in go [] t
+
+(* Free type variables in an environment *)
+let free_vars_env (env : env) : string list =
+  List.fold_left (fun acc (_, Forall (vars, t)) ->
+    let fv = free_vars_ty t in
+    let free = List.filter (fun v -> not (List.mem v vars)) fv in
+    List.fold_left (fun acc v -> if List.mem v acc then acc else v :: acc) acc free
+  ) [] env
+
+(* Generalization - create a type scheme *)
+let generalize (env : env) (t : ty) : ty_scheme =
+  let env_fv = free_vars_env env in
+  let ty_fv = free_vars_ty t in
+  let gen_vars = List.filter (fun v -> not (List.mem v env_fv)) ty_fv in
+  Forall (gen_vars, t)
+
+(* Instantiation - create a fresh instance of a type scheme *)
+let instantiate (Forall (vars, t) : ty_scheme) : ty =
+  let subst = List.map (fun v -> (v, TyVar (fresh_var ()))) vars in
+  apply_subst subst t
+
+(* Main type inference function *)
+let rec infer (env : env) (expr : expr) : (ty * subst) option =
   match expr with
-  | Int _ -> Some TyInt
-  | Float _ -> Some TyFloat
-  | String _ -> Some TyString
-  | Bool _ -> Some TyBool
-  | Var x -> List.assoc_opt x env
-  | BinOp (op, e1, e2) -> (
-      match op with
-      | Add | Sub | Mul | Div | Mod -> (
-          match infer env e1, infer env e2 with
-          | Some TyInt, Some TyInt -> Some TyInt
-          | Some TyFloat, Some TyFloat -> Some TyFloat
-          | _ -> None)
-      | Eq | Ne | Lt | Le | Gt | Ge -> (
-          match infer env e1, infer env e2 with
-          | Some t1, Some t2 when t1 = t2 -> Some TyBool
-          | _ -> None)
-      | And | Or -> (
-          match infer env e1, infer env e2 with
-          | Some TyBool, Some TyBool -> Some TyBool
-          | _ -> None))
+  (* Literals *)
+  | Int _ -> Some (TyInt, [])
+  | Float _ -> Some (TyFloat, [])
+  | String _ -> Some (TyString, [])
+  | Bool _ -> Some (TyBool, [])
+  
+  (* Variables *)
+  | Var x -> (
+      match List.assoc_opt x env with
+      | Some scheme -> Some (instantiate scheme, [])
+      | None -> None)
+  
+  (* Binary operators *)
+  | BinOp (op, e1, e2) -> infer_binop env op e1 e2
+  
+  (* Unary operators *)
   | UnOp (Not, e) -> (
       match infer env e with
-      | Some TyBool -> Some TyBool
-      | _ -> None)
+      | Some (t, s) ->
+          (match unify t TyBool with
+           | Some s' -> Some (TyBool, compose_subst s' s)
+           | None -> None)
+      | None -> None)
+  
   | UnOp (Neg, e) -> (
       match infer env e with
-      | Some TyInt -> Some TyInt
-      | Some TyFloat -> Some TyFloat
-      | _ -> None)
+      | Some (t, s) ->
+          (* Try int first, then float *)
+          (match unify t TyInt with
+           | Some s' -> Some (TyInt, compose_subst s' s)
+           | None ->
+               (match unify t TyFloat with
+                | Some s' -> Some (TyFloat, compose_subst s' s)
+                | None -> None))
+      | None -> None)
+  
+  (* Lambda abstraction *)
   | Fun (x, body) ->
       let arg_ty = TyVar (fresh_var ()) in
-      let env' = (x, arg_ty) :: env in
+      let env' = (x, Forall ([], arg_ty)) :: env in
       (match infer env' body with
-       | Some ret_ty -> Some (TyFun (arg_ty, ret_ty))
+       | Some (ret_ty, s) ->
+           let arg_ty' = apply_subst s arg_ty in
+           Some (TyFun (arg_ty', ret_ty), s)
        | None -> None)
-  | App (f, arg) -> (
-      match infer env f, infer env arg with
-      | Some (TyFun (arg_ty, ret_ty)), Some arg_ty' 
-        when arg_ty = arg_ty' -> Some ret_ty
-      | _ -> None)
-  | Let (x, e1, e2) -> (
-      match infer env e1 with
-      | Some ty1 ->
-          let env' = (x, ty1) :: env in
-          infer env' e2
-      | None -> None)
+  
+  (* Function application *)
+  | App (f, arg) ->
+      (match infer env f with
+       | Some (tf, s1) ->
+           let env' = List.map (fun (v, scheme) ->
+             (v, apply_subst_scheme s1 scheme)) env in
+           (match infer env' arg with
+            | Some (targ, s2) ->
+                let s = compose_subst s2 s1 in
+                let tf' = apply_subst s tf in
+                let ret_ty = TyVar (fresh_var ()) in
+                (match unify tf' (TyFun (targ, ret_ty)) with
+                 | Some s3 ->
+                     let s_final = compose_subst s3 s in
+                     Some (apply_subst s_final ret_ty, s_final)
+                 | None -> None)
+            | None -> None)
+       | None -> None)
+  
+  (* Let binding *)
+  | Let (x, e1, e2) ->
+      (match infer env e1 with
+       | Some (t1, s1) ->
+           let env' = List.map (fun (v, scheme) ->
+             (v, apply_subst_scheme s1 scheme)) env in
+           let scheme = generalize env' t1 in
+           let env'' = (x, scheme) :: env' in
+           (match infer env'' e2 with
+            | Some (t2, s2) -> Some (t2, compose_subst s2 s1)
+            | None -> None)
+       | None -> None)
+  
+  (* Recursive let binding *)
   | LetRec (x, e1, e2) ->
       let rec_ty = TyVar (fresh_var ()) in
-      let env' = (x, rec_ty) :: env in
+      let env' = (x, Forall ([], rec_ty)) :: env in
       (match infer env' e1 with
-       | Some ty1 when ty1 = rec_ty || true -> (* TODO: proper unification *)
-           infer env' e2
-       | _ -> None)
-  | If (cond, then_, else_) -> (
-      match infer env cond with
-      | Some TyBool -> (
-          match infer env then_, infer env else_ with
-          | Some t1, Some t2 when t1 = t2 -> Some t1
-          | _ -> None)
-      | _ -> None)
-  | Tuple exprs ->
-      let rec infer_all = function
-        | [] -> Some []
-        | e :: es -> (
-            match infer env e, infer_all es with
-            | Some t, Some ts -> Some (t :: ts)
-            | _ -> None)
-      in
-      (match infer_all exprs with
-       | Some tys -> Some (TyTuple tys)
+       | Some (t1, s1) ->
+           (match unify (apply_subst s1 rec_ty) t1 with
+            | Some s2 ->
+                let s = compose_subst s2 s1 in
+                let env'' = List.map (fun (v, scheme) ->
+                  (v, apply_subst_scheme s scheme)) env in
+                let final_ty = apply_subst s rec_ty in
+                let scheme = generalize env'' final_ty in
+                let env''' = (x, scheme) :: env'' in
+                (match infer env''' e2 with
+                 | Some (t2, s3) -> Some (t2, compose_subst s3 s)
+                 | None -> None)
+            | None -> None)
        | None -> None)
-  | List [] -> Some (TyList (TyVar (fresh_var ())))
-  | List (e :: es) -> (
-      match infer env e with
-      | Some elem_ty ->
-          let rec check_all = function
-            | [] -> true
-            | e :: es -> (
-                match infer env e with
-                | Some t when t = elem_ty -> check_all es
-                | _ -> false)
-          in
-          if check_all es then Some (TyList elem_ty) else None
-      | None -> None)
-  | Cons (e1, e2) -> (
-      match infer env e1, infer env e2 with
-      | Some elem_ty, Some (TyList list_ty) when elem_ty = list_ty ->
-          Some (TyList elem_ty)
-      | _ -> None)
-  | _ -> None (* TODO: implement remaining cases *)
+  
+  (* If-then-else *)
+  | If (cond, then_, else_) ->
+      (match infer env cond with
+       | Some (tcond, s1) ->
+           (match unify tcond TyBool with
+            | Some s2 ->
+                let s = compose_subst s2 s1 in
+                let env' = List.map (fun (v, scheme) ->
+                  (v, apply_subst_scheme s scheme)) env in
+                (match infer env' then_ with
+                 | Some (t1, s3) ->
+                     let s' = compose_subst s3 s in
+                     let env'' = List.map (fun (v, scheme) ->
+                       (v, apply_subst_scheme s' scheme)) env in
+                     (match infer env'' else_ with
+                      | Some (t2, s4) ->
+                          let s'' = compose_subst s4 s' in
+                          let t1' = apply_subst s'' t1 in
+                          let t2' = apply_subst s'' t2 in
+                          (match unify t1' t2' with
+                           | Some s5 ->
+                               let s_final = compose_subst s5 s'' in
+                               Some (apply_subst s_final t1', s_final)
+                           | None -> None)
+                      | None -> None)
+                 | None -> None)
+            | None -> None)
+       | None -> None)
+  
+  (* Tuples *)
+  | Tuple exprs ->
+      let rec infer_all env acc_types acc_subst = function
+        | [] -> Some (List.rev acc_types, acc_subst)
+        | e :: es ->
+            let env' = List.map (fun (v, scheme) ->
+              (v, apply_subst_scheme acc_subst scheme)) env in
+            (match infer env' e with
+             | Some (t, s) ->
+                 let s' = compose_subst s acc_subst in
+                 infer_all env (t :: acc_types) s' es
+             | None -> None)
+      in
+      (match infer_all env [] [] exprs with
+       | Some (tys, s) -> Some (TyTuple tys, s)
+       | None -> None)
+  
+  (* Lists *)
+  | List [] ->
+      let elem_ty = TyVar (fresh_var ()) in
+      Some (TyList elem_ty, [])
+  
+  | List (e :: es) ->
+      (match infer env e with
+       | Some (elem_ty, s1) ->
+           let rec check_all env acc_subst = function
+             | [] -> Some acc_subst
+             | e :: es ->
+                 let env' = List.map (fun (v, scheme) ->
+                   (v, apply_subst_scheme acc_subst scheme)) env in
+                 (match infer env' e with
+                  | Some (t, s) ->
+                      let s' = compose_subst s acc_subst in
+                      let elem_ty' = apply_subst s' elem_ty in
+                      let t' = apply_subst s' t in
+                      (match unify elem_ty' t' with
+                       | Some s'' ->
+                           let s_final = compose_subst s'' s' in
+                           check_all env s_final es
+                       | None -> None)
+                  | None -> None)
+           in
+           (match check_all env s1 es with
+            | Some s_final ->
+                let final_elem_ty = apply_subst s_final elem_ty in
+                Some (TyList final_elem_ty, s_final)
+            | None -> None)
+       | None -> None)
+  
+  (* Cons *)
+  | Cons (e1, e2) ->
+      (match infer env e1 with
+       | Some (elem_ty, s1) ->
+           let env' = List.map (fun (v, scheme) ->
+             (v, apply_subst_scheme s1 scheme)) env in
+           (match infer env' e2 with
+            | Some (list_ty, s2) ->
+                let s = compose_subst s2 s1 in
+                let elem_ty' = apply_subst s elem_ty in
+                (match unify list_ty (TyList elem_ty') with
+                 | Some s3 ->
+                     let s_final = compose_subst s3 s in
+                     Some (apply_subst s_final (TyList elem_ty'), s_final)
+                 | None -> None)
+            | None -> None)
+       | None -> None)
+  
+  (* Other cases - TODO *)
+  | Match _ | Variant _ | Record _ | Field _ | Seq _ -> None
 
+(* Type inference for binary operators *)
+and infer_binop (env : env) (op : binop) (e1 : expr) (e2 : expr) : (ty * subst) option =
+  match op with
+  | Add | Sub | Mul | Div | Mod ->
+      (* Arithmetic: int op int -> int OR float op float -> float *)
+      (match infer env e1, infer env e2 with
+       | Some (t1, s1), Some (t2, s2) ->
+           let s = compose_subst s2 s1 in
+           let t1' = apply_subst s t1 in
+           let t2' = apply_subst s t2 in
+           (* Try int first *)
+           (match unify t1' TyInt with
+            | Some s3 ->
+                let s' = compose_subst s3 s in
+                (match unify (apply_subst s' t2') TyInt with
+                 | Some s4 -> Some (TyInt, compose_subst s4 s')
+                 | None -> None)
+            | None ->
+                (* Try float *)
+                (match unify t1' TyFloat with
+                 | Some s3 ->
+                     let s' = compose_subst s3 s in
+                     (match unify (apply_subst s' t2') TyFloat with
+                      | Some s4 -> Some (TyFloat, compose_subst s4 s')
+                      | None -> None)
+                 | None -> None))
+       | _ -> None)
+  
+  | Eq | Ne | Lt | Le | Gt | Ge ->
+      (* Comparison: 'a op 'a -> bool *)
+      (match infer env e1, infer env e2 with
+       | Some (t1, s1), Some (t2, s2) ->
+           let s = compose_subst s2 s1 in
+           let t1' = apply_subst s t1 in
+           let t2' = apply_subst s t2 in
+           (match unify t1' t2' with
+            | Some s3 -> Some (TyBool, compose_subst s3 s)
+            | None -> None)
+       | _ -> None)
+  
+  | And | Or ->
+      (* Logical: bool op bool -> bool *)
+      (match infer env e1, infer env e2 with
+       | Some (t1, s1), Some (t2, s2) ->
+           let s = compose_subst s2 s1 in
+           (match unify (apply_subst s t1) TyBool with
+            | Some s3 ->
+                let s' = compose_subst s3 s in
+                (match unify (apply_subst s' t2) TyBool with
+                 | Some s4 -> Some (TyBool, compose_subst s4 s')
+                 | None -> None)
+            | None -> None)
+       | _ -> None)
+
+
+(* Type check a single declaration *)
+let type_check_decl (env : env) (decl : decl) : ((string * ty) * env) option =
+  match decl with
+  | DeclLet (name, expr) -> (
+      match infer env expr with
+      | Some (ty, s) ->
+          let env' = List.map (fun (v, scheme) ->
+            (v, apply_subst_scheme s scheme)) env in
+          let scheme = generalize env' ty in
+          let env'' = (name, scheme) :: env' in
+          Some ((name, ty), env'')
+      | None -> None)
+  
+  | DeclLetRec (name, expr) ->
+      let rec_ty = TyVar (fresh_var ()) in
+      let env' = (name, Forall ([], rec_ty)) :: env in
+      (match infer env' expr with
+       | Some (ty, s) ->
+           (match unify (apply_subst s rec_ty) ty with
+            | Some s2 ->
+                let s_final = compose_subst s2 s in
+                let env'' = List.map (fun (v, scheme) ->
+                  (v, apply_subst_scheme s_final scheme)) env in
+                let final_ty = apply_subst s_final rec_ty in
+                let scheme = generalize env'' final_ty in
+                let env''' = (name, scheme) :: env'' in
+                Some ((name, final_ty), env''')
+            | None -> None)
+       | None -> None)
+  
+  | _ -> None  (* Skip other declarations for now *)
+
+(* Type check an entire program *)
+let type_check_program (prog : program) : (string * ty) list option =
+  reset_fresh_vars ();
+  let rec go env acc = function
+    | [] -> Some (List.rev acc)
+    | decl :: rest ->
+        (match type_check_decl env decl with
+         | Some ((name, ty), env') -> go env' ((name, ty) :: acc) rest
+         | None -> None)
+  in
+  go [] [] prog
+
+(* Simple type check for single expression (for backward compatibility) *)
 let type_check (expr : expr) : ty option =
-  infer [] expr
+  reset_fresh_vars ();
+  match infer [] expr with
+  | Some (ty, _) -> Some ty
+  | None -> None

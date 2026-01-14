@@ -29,20 +29,16 @@ let () =
     Printf.printf "✓ Parsing successful\n";
     Printf.printf "AST:\n%s\n\n" (Onoki_lib.Ast.show_program ast);
 
-    (* Type check each declaration *)
+    (* Type check the entire program *)
     Printf.printf "=== Type Checking ===\n";
-    List.iter (fun decl ->
-      match decl with
-      | Onoki_lib.Ast.DeclLet (name, expr) 
-      | Onoki_lib.Ast.DeclLetRec (name, expr) -> (
-          match Onoki_lib.Typing.type_check expr with
-          | Some ty -> 
-              Printf.printf "✓ %s : %s\n" name (Onoki_lib.Ast.show_ty ty)
-          | None -> 
-              Printf.printf "✗ %s : type error\n" name)
-      | _ -> ()
-    ) ast;
-    Printf.printf "\n";
+    (match Onoki_lib.Typing.type_check_program ast with
+     | Some bindings ->
+         List.iter (fun (name, ty) ->
+           Printf.printf "✓ %s : %s\n" name (Onoki_lib.Ast.show_ty ty)
+         ) bindings;
+         Printf.printf "\n"
+     | None ->
+         Printf.printf "✗ Type checking failed\n\n");
 
     (* Lower to Lambda IR *)
     Printf.printf "=== Lambda IR ===\n";

@@ -1,0 +1,7 @@
+(* Test polymorphic identity function *)
+
+let rec id = fun x -> x
+
+let a = id 5
+let b = id true
+let c = id "hello"
