@@ -50,6 +50,8 @@ type instruction =
   | If_icmple of int
   | If_icmpgt of int
   | If_icmpge of int
+  | If_acmpeq of int
+  | If_acmpne of int
   | Goto of int
   
   (* Method invocation *)
@@ -176,6 +178,8 @@ let encode_instruction (instr : instruction) : bytes =
    | If_icmple offset -> add_u1 0xa4; add_i2 offset
    | If_icmpgt offset -> add_u1 0xa3; add_i2 offset
    | If_icmpge offset -> add_u1 0xa2; add_i2 offset
+   | If_acmpeq offset -> add_u1 0xa5; add_i2 offset
+   | If_acmpne offset -> add_u1 0xa6; add_i2 offset
    | Goto offset -> add_u1 0xa7; add_i2 offset
    
    (* Method invocation *)

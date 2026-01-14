@@ -33,8 +33,12 @@ let () =
     Printf.printf "=== Type Checking ===\n";
     (match Onoki_lib.Typing.type_check_program ast with
      | Some bindings ->
-         List.iter (fun (name, ty) ->
-           Printf.printf "✓ %s : %s\n" name (Onoki_lib.Ast.show_ty ty)
+         List.iter (fun (name, binding) ->
+           match binding with
+           | Onoki_lib.Typing.BindValue (Onoki_lib.Typing.Forall (_, ty)) ->
+               Printf.printf "✓ %s : %s\n" name (Onoki_lib.Ast.show_ty ty)
+           | Onoki_lib.Typing.BindModule _ ->
+               Printf.printf "✓ module %s\n" name
          ) bindings;
          Printf.printf "\n"
      | None ->

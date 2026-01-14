@@ -26,6 +26,8 @@ type codegen_ctx = {
   mutable label_positions: (int * int) list; (* Label ID -> instruction index *)
   mutable pending_branches: (int * label * instruction) list; (* Instruction index -> Label ID -> Instruction *)
   mutable functions: function_def list; (* Extracted functions *)
+  mutable externs: (string * string) list; (* External function mapping: name -> impl *)
+  mutable current_module: string option; (* Current module name for static field fallback *)
 }
 
 let create_context () = {
@@ -38,6 +40,8 @@ let create_context () = {
   label_positions = [];
   pending_branches = [];
   functions = [];
+  externs = [];
+  current_module = None;
 }
 
 
@@ -46,7 +50,10 @@ let rec free_vars (expr : lambda) : StringSet.t =
   match expr with
   | LConst _ -> StringSet.empty
   | LVar x -> 
-      if List.mem x ["add"; "sub"; "mul"; "div"; "mod"; "eq"; "ne"; "lt"; "le"; "gt"; "ge"; "cons"; "nil"; "not"; "neg"] then
+      if List.mem x ["__add"; "__sub"; "__mul"; "__div"; "__mod"; 
+                     "__eq"; "__ne"; "__lt"; "__le"; "__gt"; "__ge"; 
+                     "__and"; "__or"; "__not"; "__neg";
+                     "cons"; "nil"; "head"; "tail"; "is_empty"; "^"] then
         StringSet.empty 
       else 
         StringSet.singleton x
@@ -173,6 +180,8 @@ let resolve_labels (ctx : codegen_ctx) : instruction list =
          | If_icmple _ -> If_icmple offset
          | If_icmpgt _ -> If_icmpgt offset
          | If_icmpge _ -> If_icmpge offset
+         | If_acmpeq _ -> If_acmpeq offset
+         | If_acmpne _ -> If_acmpne offset
          | Goto _ -> Goto offset
          | _ -> failwith "Not a branch instruction")
     | None -> instr
@@ -248,6 +257,128 @@ let unbox_bool (ctx : codegen_ctx) =
   emit ctx (Checkcast class_idx);
   emit ctx (Invokevirtual method_idx)
 
+(* Parse method descriptor to get argument types and return type *)
+(* e.g. "(IDLjava/lang/String;)V" -> (["I"; "D"; "Ljava/lang/String;"], "V") *)
+let parse_descriptor (desc : string) : string list * string =
+  let len = String.length desc in
+  let rec parse_args i acc =
+    if i >= len then failwith "Invalid descriptor: unexpected end"
+    else match desc.[i] with
+    | ')' -> (List.rev acc, String.sub desc (i+1) (len - i - 1))
+    | 'B' | 'C' | 'D' | 'F' | 'I' | 'J' | 'S' | 'Z' ->
+        parse_args (i + 1) (String.make 1 desc.[i] :: acc)
+    | 'L' ->
+        let start = i in
+        let rec find_semi k =
+          if k >= len then failwith "Invalid descriptor: missing semicolon"
+          else if desc.[k] = ';' then k
+          else find_semi (k + 1)
+        in
+        let semi = find_semi (start + 1) in
+        let type_str = String.sub desc start (semi - start + 1) in
+        parse_args (semi + 1) (type_str :: acc)
+    | '[' ->
+        let rec count_dims k = 
+          if k < len && desc.[k] = '[' then count_dims (k + 1)
+          else k
+        in
+        let start_type = count_dims (i + 1) in
+        let (end_type, _) = 
+          match desc.[start_type] with
+          | 'L' -> 
+              let rec find_semi k = if desc.[k] = ';' then k else find_semi (k + 1) in
+              (find_semi start_type, "") 
+          | _ -> (start_type, "")
+        in
+        let type_str = String.sub desc i (end_type - i + 1) in
+        parse_args (end_type + 1) (type_str :: acc)
+    | _ -> failwith ("Invalid descriptor char: " ^ (String.make 1 desc.[i]))
+  in
+  if len > 0 && desc.[0] = '(' then parse_args 1 []
+  else failwith "Invalid descriptor: must start with ("
+
+(* Generate code for external call *)
+(* impl: "kind class method descriptor" *)
+let gen_external_call (ctx : codegen_ctx) (impl : string) (args : lambda list) (generator : codegen_ctx -> lambda -> unit) : unit =
+  let parts = String.split_on_char ' ' impl in
+  match parts with
+  | kind :: class_name :: method_name :: descriptor :: _ ->
+      let (arg_types, ret_type) = parse_descriptor descriptor in
+      
+      let generate_args current_args =
+        let rec loop args types =
+          match args, types with
+          | [], [] -> ()
+          | a :: as_, t :: ts ->
+              generator ctx a;
+              (match t with
+              | "I" -> unbox_int ctx
+              | "Z" -> unbox_bool ctx
+              | _ -> 
+                 if String.length t > 0 && t.[0] = 'L' then
+                   let cls = String.sub t 1 (String.length t - 2) in
+                   let class_idx = add_class ctx.cpb cls in
+                   emit ctx (Checkcast class_idx)
+                 else ());
+              loop as_ ts
+          | a :: as_, [] ->
+              (* Extra argument (likely unit), evaluate and discard *)
+              generator ctx a;
+              emit ctx Pop;
+              loop as_ []
+          | [], _ :: _ -> failwith "Not enough arguments for external call"
+        in
+        loop current_args arg_types
+      in
+
+      (match kind with
+       | "static" ->
+           generate_args args;
+           let method_idx = add_methodref ctx.cpb class_name method_name descriptor in
+           emit ctx (Invokestatic method_idx)
+       
+       | "virtual" ->
+           (* First arg is receiver *)
+           (match args with
+            | receiver :: rest_args ->
+                generator ctx receiver;
+                let class_idx = add_class ctx.cpb class_name in
+                emit ctx (Checkcast class_idx);
+                
+                (* Generate rest args *)
+                generate_args rest_args;
+                
+                let method_idx = add_methodref ctx.cpb class_name method_name descriptor in
+                emit ctx (Invokevirtual method_idx)
+            | [] -> failwith "Virtual method call requires receiver")
+
+       | "new" ->
+           let class_idx = add_class ctx.cpb class_name in
+           emit ctx (New class_idx);
+           emit ctx Dup;
+           (* Constructor args *)
+           generate_args args;
+           let init_idx = add_methodref ctx.cpb class_name "<init>" descriptor in
+           emit ctx (Invokespecial init_idx)
+           (* Object is left on stack *)
+
+       | _ -> failwith ("Unknown external kind: " ^ kind));
+
+      (* Handle return type *)
+      (* new returns object, static/virtual return what descriptor says *)
+      if kind <> "new" then (
+        match ret_type with
+        | "V" ->
+            (* Function must return something, push nil *)
+            let nil_idx = add_fieldref ctx.cpb "OnokiNil" "INSTANCE" "LOnokiNil;" in
+            emit ctx (Getstatic nil_idx)
+        | "I" -> box_int ctx
+        | "Z" -> box_bool ctx
+        | _ -> () (* Already object *)
+      )
+
+  | _ -> failwith ("Invalid implementation string: " ^ impl)
+
 (* Generate code for a Lambda expression *)
 let rec gen_lambda (ctx : codegen_ctx) (expr : lambda) : unit =
   match expr with
@@ -260,33 +391,73 @@ let rec gen_lambda (ctx : codegen_ctx) (expr : lambda) : unit =
        | CString _ -> () (* Strings are already objects *)
        | _ -> ()) (* Float not implemented yet *)
 
+  | LExtern (name, impl) ->
+      ctx.externs <- (name, impl) :: ctx.externs
+
+  | LApp (LVar fname, args) when List.mem_assoc fname ctx.externs ->
+      let impl = List.assoc fname ctx.externs in
+      gen_external_call ctx impl args gen_lambda
+
+  | LTuple exprs ->
+      (* Create Object[] array *)
+      emit ctx (Bipush (List.length exprs));
+      let obj_class_idx = add_class ctx.cpb "java/lang/Object" in
+      emit ctx (Anewarray obj_class_idx);
+      
+      List.iteri (fun i e ->
+        emit ctx Dup; (* Keep array on stack *)
+        emit ctx (Bipush i);
+        gen_lambda ctx e;
+        emit ctx Aastore;
+      ) exprs;
+      (* Array is on stack *)
+
+  | LField (tuple, index) ->
+      gen_lambda ctx tuple;
+      (* Cast to Object[] *)
+      let array_class_idx = add_class ctx.cpb "[Ljava/lang/Object;" in
+      emit ctx (Checkcast array_class_idx);
+      emit ctx (Bipush index);
+      emit ctx Aaload
+
+
+  | LVar "nil" ->
+      let nil_idx = add_fieldref ctx.cpb "OnokiNil" "INSTANCE" "LOnokiNil;" in
+      emit ctx (Getstatic nil_idx)
+  
   | LVar x -> (
-      match lookup_local ctx x with
-      | Some slot ->
-          if slot <= 3 then
-            emit ctx (match slot with
-              | 0 -> Aload_0
-              | 1 -> Aload_1
-              | 2 -> Aload_2
-              | 3 -> Aload_3
-              | _ -> failwith "impossible")
-          else
-            emit ctx (Aload slot)
-      | None ->
-          (* Check if it is a global function *)
-          if List.exists (fun f -> f.name = x) ctx.functions then
-             (* Instantiate wrapper closure *)
-             let class_name = "Closure$" ^ x in
-             let class_idx = add_class ctx.cpb class_name in
-             (* We assume wrapper has default constructor *)
-             emit ctx (New class_idx);
-             emit ctx Dup;
-             let init_idx = add_methodref ctx.cpb class_name "<init>" "()V" in
-             emit ctx (Invokespecial init_idx)
-          else
-             (* Fail or ignore? For now ignore to avoid crashing on Phase 1 tests if any? *)
-             ()
-      )
+      if String.contains x '.' then
+        (match String.split_on_char '.' x with
+         | [cls; field] -> 
+             let field_ref = add_fieldref ctx.cpb cls field "Ljava/lang/Object;" in
+             emit ctx (Getstatic field_ref)
+         | _ -> failwith "Invalid qualified name")
+      else
+        match lookup_local ctx x with
+        | Some idx -> 
+            if idx <= 3 then 
+              emit ctx (match idx with 0 -> Aload_0 | 1 -> Aload_1 | 2 -> Aload_2 | 3 -> Aload_3 | _ -> failwith "impossible")
+            else
+              emit ctx (Aload idx)
+        | None ->
+            (* Check globals/functions *)
+            match List.find_opt (fun f -> f.name = x) ctx.functions with
+            | Some _func ->
+               (* Instantiate wrapper closure *)
+               let class_name = "Closure$" ^ x in
+               let class_idx = add_class ctx.cpb class_name in
+               emit ctx (New class_idx);
+               emit ctx Dup;
+               let init_idx = add_methodref ctx.cpb class_name "<init>" "()V" in
+               emit ctx (Invokespecial init_idx)
+            | None -> 
+                (* Check module fields if in module context *)
+                match ctx.current_module with
+                | Some mod_name ->
+                    let field_ref = add_fieldref ctx.cpb mod_name x "Ljava/lang/Object;" in
+                    emit ctx (Getstatic field_ref)
+                | None -> failwith ("Undefined variable: " ^ x)
+    )
   
   | LLet (x, e1, e2) ->
       gen_lambda ctx e1;
@@ -299,21 +470,85 @@ let rec gen_lambda (ctx : codegen_ctx) (expr : lambda) : unit =
         emit ctx (Astore slot);
       gen_lambda ctx e2
 
-  | LApp (LVar op, [e1; e2]) when List.mem op ["add"; "sub"; "mul"; "div"; "mod"] ->
+  | LApp (LVar "cons", [head; tail]) ->
+      let cons_idx = add_class ctx.cpb "OnokiCons" in
+      emit ctx (New cons_idx);
+      emit ctx Dup;
+      gen_lambda ctx head;
+      gen_lambda ctx tail;
+      let init_idx = add_methodref ctx.cpb "OnokiCons" "<init>" "(Ljava/lang/Object;Ljava/lang/Object;)V" in
+      emit ctx (Invokespecial init_idx)
+
+  | LApp (LVar "head", [list]) ->
+      gen_lambda ctx list;
+      let cons_idx = add_class ctx.cpb "OnokiCons" in
+      emit ctx (Checkcast cons_idx);
+      let head_ref = add_fieldref ctx.cpb "OnokiCons" "head" "Ljava/lang/Object;" in
+      emit ctx (Getfield head_ref)
+
+  | LApp (LVar "tail", [list]) ->
+      gen_lambda ctx list;
+      let cons_idx = add_class ctx.cpb "OnokiCons" in
+      emit ctx (Checkcast cons_idx);
+      let tail_ref = add_fieldref ctx.cpb "OnokiCons" "tail" "Ljava/lang/Object;" in
+      emit ctx (Getfield tail_ref)
+
+  | LApp (LVar "is_empty", [list]) ->
+      gen_lambda ctx list;
+      (* Compare with OnokiNil.INSTANCE using reference equality *)
+      (* We assume we can load it and check equality *)
+      let nil_inst_ref = add_fieldref ctx.cpb "OnokiNil" "INSTANCE" "LOnokiNil;" in
+      emit ctx (Getstatic nil_inst_ref);
+      
+      let true_label = fresh_label () in
+      let end_label = fresh_label () in
+      
+      emit_branch ctx (If_acmpeq 0) true_label; 
+      (* If_acmpeq is standard JVM instruction 0xA5. Jvminstr.ml might not have it. *)
+      (* Assuming it's added or I use a workaround if not. *)
+      (* Wait, I didn't check for If_acmpeq in Jvminstr.ml. *)
+      (* If it's missing, I should add it. *)
+      (* Checking Jvminstr.ml content from memory... *)
+      (* I saw If_icmpeq, but not If_acmpeq in the view_file output earlier. *)
+      (* Let's check Jvminstr.ml in next step if needed. *)
+      (* Or I can use Object.equals *)
+      (* But OnokiNil is a singleton so reference equality is correct. *)
+      (* Use If_acmpeq assuming I will add it or it exists. *)
+
+      emit ctx Iconst_0;
+      emit_branch ctx (Goto 0) end_label;
+      set_label ctx true_label;
+      emit ctx Iconst_1;
+      set_label ctx end_label;
+      box_bool ctx
+
+  | LApp (LVar "^", [s1; s2]) ->
+      (* String concatenation *)
+      gen_lambda ctx s1;
+      let string_idx = add_class ctx.cpb "java/lang/String" in
+      emit ctx (Checkcast string_idx);
+      
+      gen_lambda ctx s2;
+      emit ctx (Checkcast string_idx);
+      
+      let concat_idx = add_methodref ctx.cpb "java/lang/String" "concat" "(Ljava/lang/String;)Ljava/lang/String;" in
+      emit ctx (Invokevirtual concat_idx)
+
+  | LApp (LVar op, [e1; e2]) when List.mem op ["__add"; "__sub"; "__mul"; "__div"; "__mod"] ->
       gen_lambda ctx e1;
       unbox_int ctx;
       gen_lambda ctx e2;
       unbox_int ctx;
       (match op with
-       | "add" -> emit ctx Iadd
-       | "sub" -> emit ctx Isub
-       | "mul" -> emit ctx Imul
-       | "div" -> emit ctx Idiv
-       | "mod" -> emit ctx Irem
+       | "__add" -> emit ctx Iadd
+       | "__sub" -> emit ctx Isub
+       | "__mul" -> emit ctx Imul
+       | "__div" -> emit ctx Idiv
+       | "__mod" -> emit ctx Irem
        | _ -> failwith "Unknown operator");
       box_int ctx
 
-  | LApp (LVar op, args) when List.mem op ["eq"; "ne"; "lt"; "le"; "gt"; "ge"] ->
+  | LApp (LVar op, args) when List.mem op ["__eq"; "__ne"; "__lt"; "__le"; "__gt"; "__ge"] ->
       (* Comparison operators - unbox, compare, return boxed boolean *)
       (match args with
        | [e1; e2] ->
@@ -326,12 +561,12 @@ let rec gen_lambda (ctx : codegen_ctx) (expr : lambda) : unit =
            let true_label = fresh_label () in
            let end_label = fresh_label () in
            (match op with
-            | "eq" -> emit_branch ctx (If_icmpeq 0) true_label
-            | "ne" -> emit_branch ctx (If_icmpne 0) true_label
-            | "lt" -> emit_branch ctx (If_icmplt 0) true_label
-            | "le" -> emit_branch ctx (If_icmple 0) true_label
-            | "gt" -> emit_branch ctx (If_icmpgt 0) true_label
-            | "ge" -> emit_branch ctx (If_icmpge 0) true_label
+            | "__eq" -> emit_branch ctx (If_icmpeq 0) true_label
+            | "__ne" -> emit_branch ctx (If_icmpne 0) true_label
+            | "__lt" -> emit_branch ctx (If_icmplt 0) true_label
+            | "__le" -> emit_branch ctx (If_icmple 0) true_label
+            | "__gt" -> emit_branch ctx (If_icmpgt 0) true_label
+            | "__ge" -> emit_branch ctx (If_icmpge 0) true_label
             | _ -> failwith "Unknown comparison");
            
            emit ctx Iconst_0; (* False *)
@@ -446,7 +681,13 @@ let rec gen_lambda (ctx : codegen_ctx) (expr : lambda) : unit =
               emit ctx (match slot with 0 -> Aload_0 | 1 -> Aload_1 | 2 -> Aload_2 | 3 -> Aload_3 | _ -> failwith "imp")
             else
               emit ctx (Aload slot)
-        | None -> failwith ("Capture variable not found: " ^ cap)
+        | None -> 
+            (* Check module fields matching capture *)
+            match ctx.current_module with
+            | Some mod_name ->
+                let field_ref = add_fieldref ctx.cpb mod_name cap "Ljava/lang/Object;" in
+                emit ctx (Getstatic field_ref)
+            | None -> failwith ("Capture variable not found: " ^ cap)
       ) captures;
       
       (* Init signature *)
@@ -455,8 +696,8 @@ let rec gen_lambda (ctx : codegen_ctx) (expr : lambda) : unit =
       emit ctx (Invokespecial init_idx)
 
 
-  | _ ->
-      failwith "Unsupported Lambda form in codegen"
+  | stmt ->
+      failwith ("Unsupported Lambda form in codegen: " ^ (show_lambda stmt))
 
 (* Generate a closure class *)
 and generate_closure_class (id : string) (params : string list) (body : lambda) (captures : string list) (functions : function_def list) : bytes =
@@ -610,7 +851,9 @@ let generate_function_method (cpb : cp_builder) (functions : function_def list) 
     cpb;
     label_positions = [];
     pending_branches = [];
-    functions;  
+    functions;
+    externs = [];
+    current_module = None;
   } in
   
   (* Allocate parameters to locals *)
@@ -683,17 +926,314 @@ let generate_function_interface () : bytes =
   
   write_class_file class_file
 
+(* Generate List classes (OnokiList, OnokiCons, OnokiNil) *)
+let generate_list_classes () : (string * bytes) list =
+  let classes = ref [] in
+  
+  (* 1. OnokiList Interface *)
+  let ctx_list = create_context () in
+  let list_class_idx = add_class ctx_list.cpb "OnokiList" in
+  let object_class_idx = add_class ctx_list.cpb "java/lang/Object" in
+  
+  let list_class_file = {
+    minor_version = 0;
+    major_version = 50;
+    constant_pool = ctx_list.cpb;
+    access_flags = acc_public lor acc_interface lor acc_abstract;
+    this_class = list_class_idx;
+    super_class = object_class_idx;
+    interfaces = [];
+    fields = [];
+    methods = [];
+    attributes = [];
+  } in
+  classes := ("OnokiList.class", write_class_file list_class_file) :: !classes;
+  
+  (* 2. OnokiCons Class *)
+  let ctx_cons = create_context () in
+  let cons_class_idx = add_class ctx_cons.cpb "OnokiCons" in
+  let list_interface_idx = add_class ctx_cons.cpb "OnokiList" in
+  let object_class_idx = add_class ctx_cons.cpb "java/lang/Object" in
+  
+  (* Fields: head, tail *)
+  let head_name_idx = add_utf8 ctx_cons.cpb "head" in
+  let tail_name_idx = add_utf8 ctx_cons.cpb "tail" in
+  let obj_desc_idx = add_utf8 ctx_cons.cpb "Ljava/lang/Object;" in
+  
+  let fields = [
+    { access_flags = acc_public; name_index = head_name_idx; descriptor_index = obj_desc_idx; attributes = [] };
+    { access_flags = acc_public; name_index = tail_name_idx; descriptor_index = obj_desc_idx; attributes = [] };
+  ] in
+  
+  (* Constructor(Object head, Object tail) *)
+  let init_name_idx = add_utf8 ctx_cons.cpb "<init>" in
+  let init_desc_idx = add_utf8 ctx_cons.cpb "(Ljava/lang/Object;Ljava/lang/Object;)V" in
+  
+  let init_ctx = create_context () in
+  init_ctx.cpb <- ctx_cons.cpb;
+  init_ctx.next_local <- 3; (* this, head, tail *)
+  
+  emit init_ctx Aload_0;
+  let super_init = add_methodref ctx_cons.cpb "java/lang/Object" "<init>" "()V" in
+  emit init_ctx (Invokespecial super_init);
+  
+  (* this.head = head *)
+  emit init_ctx Aload_0;
+  emit init_ctx Aload_1;
+  let head_ref = add_fieldref ctx_cons.cpb "OnokiCons" "head" "Ljava/lang/Object;" in
+  emit init_ctx (Putfield head_ref);
+  
+  (* this.tail = tail *)
+  emit init_ctx Aload_0;
+  emit init_ctx Aload_2;
+  let tail_ref = add_fieldref ctx_cons.cpb "OnokiCons" "tail" "Ljava/lang/Object;" in
+  emit init_ctx (Putfield tail_ref);
+  
+  emit init_ctx Return;
+  
+  let init_code = encode_instructions init_ctx.instructions in
+  let _code_name_idx = add_utf8 ctx_cons.cpb "Code" in
+  
+  let init_code_attr = Code {
+    max_stack = 2;
+    max_locals = 3;
+    code = init_code;
+    exception_table = [];
+    attributes = [];
+  } in
+  
+  let init_method : method_info = {
+    access_flags = acc_public;
+    name_index = init_name_idx;
+    descriptor_index = init_desc_idx;
+    attributes = [init_code_attr];
+  } in
+  
+  let cons_class_file = {
+    minor_version = 0;
+    major_version = 50;
+    constant_pool = ctx_cons.cpb;
+    access_flags = acc_public lor acc_super;
+    this_class = cons_class_idx;
+    super_class = object_class_idx;
+    interfaces = [list_interface_idx];
+    fields = fields;
+    methods = [init_method];
+    attributes = [];
+  } in
+  classes := ("OnokiCons.class", write_class_file cons_class_file) :: !classes;
+
+  (* 3. OnokiNil Class (Singleton) *)
+  let ctx_nil = create_context () in
+  let nil_class_idx = add_class ctx_nil.cpb "OnokiNil" in
+  let list_interface_idx = add_class ctx_nil.cpb "OnokiList" in
+  let object_class_idx = add_class ctx_nil.cpb "java/lang/Object" in
+  
+  (* Field: public static final OnokiNil INSTANCE *)
+  let instance_name_idx = add_utf8 ctx_nil.cpb "INSTANCE" in
+  let nil_desc_idx = add_utf8 ctx_nil.cpb "LOnokiNil;" in
+  let instance_field = {
+    access_flags = acc_public lor acc_static lor acc_final;
+    name_index = instance_name_idx;
+    descriptor_index = nil_desc_idx;
+    attributes = [];
+  } in
+  
+  (* Constructor (private) *)
+  let init_name_idx = add_utf8 ctx_nil.cpb "<init>" in
+  let init_desc_idx = add_utf8 ctx_nil.cpb "()V" in
+  
+  let init_ctx = create_context () in
+  init_ctx.cpb <- ctx_nil.cpb;
+  init_ctx.next_local <- 1;
+  
+  emit init_ctx Aload_0;
+  let super_init = add_methodref ctx_nil.cpb "java/lang/Object" "<init>" "()V" in
+  emit init_ctx (Invokespecial super_init);
+  emit init_ctx Return;
+  
+  let init_code = encode_instructions init_ctx.instructions in
+  let _code_name_idx = add_utf8 ctx_nil.cpb "Code" in
+  
+  let init_code_attr = Code {
+    max_stack = 1;
+    max_locals = 1;
+    code = init_code;
+    exception_table = [];
+    attributes = [];
+  } in
+  
+  let init_method : method_info = {
+    access_flags = acc_private; (* Singleton *)
+    name_index = init_name_idx;
+    descriptor_index = init_desc_idx;
+    attributes = [init_code_attr];
+  } in
+  
+  (* Static Initializer <clinit> *)
+  let clinit_name_idx = add_utf8 ctx_nil.cpb "<clinit>" in
+  
+  let clinit_ctx = create_context () in
+  clinit_ctx.cpb <- ctx_nil.cpb;
+  clinit_ctx.next_local <- 0;
+  
+  let nil_class_idx_ref = add_class ctx_nil.cpb "OnokiNil" in 
+  emit clinit_ctx (New nil_class_idx_ref);
+  emit clinit_ctx Dup;
+  let init_ref = add_methodref ctx_nil.cpb "OnokiNil" "<init>" "()V" in
+  emit clinit_ctx (Invokespecial init_ref);
+  let instance_ref = add_fieldref ctx_nil.cpb "OnokiNil" "INSTANCE" "LOnokiNil;" in
+  emit clinit_ctx (Putstatic instance_ref); (* Use Putstatic for singleton *)
+  emit clinit_ctx Return;
+
+  let clinit_code = encode_instructions clinit_ctx.instructions in
+  
+  let clinit_code_attr = Code {
+    max_stack = 2;
+    max_locals = 0;
+    code = clinit_code;
+    exception_table = [];
+    attributes = [];
+  } in
+
+  let clinit_method : method_info = {
+    access_flags = acc_public lor acc_static;
+    name_index = clinit_name_idx;
+    descriptor_index = init_desc_idx; (* ()V *)
+    attributes = [clinit_code_attr];
+  } in
+  
+  let nil_class_file = {
+    minor_version = 0;
+    major_version = 50;
+    constant_pool = ctx_nil.cpb;
+    access_flags = acc_public lor acc_super;
+    this_class = nil_class_idx;
+    super_class = object_class_idx;
+    interfaces = [list_interface_idx];
+    fields = [instance_field];
+    methods = [init_method; clinit_method];
+    attributes = [];
+  } in
+  classes := ("OnokiNil.class", write_class_file nil_class_file) :: !classes;
+  
+  !classes
+
+(* Generate Module class *)
+let generate_module_class (name : string) (decls : lambda list) (functions: function_def list) (externs: (string * string) list) : (string * bytes) =
+  let cpb = create_cp_builder () in
+  
+  (* 1. Generate static fields for bindings *)
+  let fields = List.filter_map (function
+    | LLet (x, _, _) ->
+        let name_idx = add_utf8 cpb x in
+        let desc_idx = add_utf8 cpb "Ljava/lang/Object;" in
+        Some {
+          access_flags = acc_public lor acc_static;
+          name_index = name_idx;
+          descriptor_index = desc_idx;
+          attributes = [];
+        }
+    | _ -> None
+  ) decls in
+
+  (* 2. Generate <clinit> *)
+  let ctx = create_context () in
+  ctx.cpb <- cpb;
+  (* Pass global functions/externs so module can call them *)
+  ctx.functions <- functions;
+  ctx.externs <- externs;
+  ctx.current_module <- Some name;
+  
+  let rec gen_clinit = function
+    | [] -> ()
+    | stmt :: rest -> (
+        match stmt with
+        | LLet (x, e, _) -> 
+            gen_lambda ctx e;
+            let field_ref = add_fieldref cpb name x "Ljava/lang/Object;" in
+            emit ctx (Putstatic field_ref);
+            gen_clinit rest
+        | LExtern (n, impl) ->
+            ctx.externs <- (n, impl) :: ctx.externs;
+            gen_clinit rest
+        | _ -> gen_clinit rest 
+    )
+  in
+  gen_clinit decls;
+  
+  emit ctx Return;
+  
+  (* Resolve clinit *)
+  let resolved_instrs = resolve_labels ctx in
+  let code_bytes = encode_instructions resolved_instrs in
+  let _code_name_idx = add_utf8 cpb "Code" in
+  
+  let code_attr = Code {
+    max_stack = ctx.max_stack + 2;
+    max_locals = ctx.next_local; 
+    code = code_bytes;
+    exception_table = [];
+    attributes = [];
+  } in
+  
+  let clinit_name_idx = add_utf8 cpb "<clinit>" in
+  let clinit_desc_idx = add_utf8 cpb "()V" in
+  let clinit_method : method_info = {
+    access_flags = acc_public lor acc_static;
+    name_index = clinit_name_idx;
+    descriptor_index = clinit_desc_idx;
+    attributes = [code_attr];
+  } in
+  
+  (* 3. Generate static methods for functions defined in this module *)
+  let initial_names = List.map (fun f -> f.name) functions in
+  let new_functions = List.filter (fun f -> not (List.mem f.name initial_names)) ctx.functions in
+  
+  let fn_methods = List.map (generate_function_method cpb ctx.functions) (List.rev new_functions) in
+  
+  (* Build class *)
+  let this_idx = add_class cpb name in
+  let super_idx = add_class cpb "java/lang/Object" in
+  let class_file = {
+    minor_version = 0;
+    major_version = 50;
+    constant_pool = cpb;
+    access_flags = acc_public lor acc_super;
+    this_class = this_idx;
+    super_class = super_idx;
+    interfaces = [];
+    fields = fields;
+    methods = clinit_method :: fn_methods;
+    attributes = [];
+  } in
+  (name ^ ".class", write_class_file class_file)
+
 (* Generate all classes *)
 let generate_classes (prog : lambda list) : (string * bytes) list =
   (* 1. Generate Main class *)
   reset_labels ();
   global_closure_counter := 0;
   global_closure_list := [];
+  
+  (* Generate runtime classes *)
+  let list_classes = generate_list_classes () in
   let ctx = create_context () in
   
   (* Reserve local 0 for 'args' parameter *)
   ctx.next_local <- 1;
   
+  (* Separate modules from main program *)
+  let modules = List.filter_map (function
+    | LModule (name, decls) -> Some (name, decls)
+    | _ -> None
+  ) prog in
+  
+  let main_prog = List.filter (function
+    | LModule _ -> false
+    | _ -> true
+  ) prog in
+
   (* Generate code for program *)
   let rec gen_prog = function
     | [] -> ()
@@ -706,11 +1246,16 @@ let generate_classes (prog : lambda list) : (string * bytes) list =
         emit ctx Swap;
         emit ctx (Invokevirtual println_idx)
     | stmt :: rest ->
-        gen_lambda ctx stmt;
-        emit ctx Pop; (* Discard result of declaration *)
-        gen_prog rest
+        (match stmt with
+         | LExtern _ -> 
+             gen_lambda ctx stmt;
+             gen_prog rest
+         | _ -> 
+             gen_lambda ctx stmt;
+             emit ctx Pop; (* Discard result of declaration *)
+             gen_prog rest)
   in
-  gen_prog prog;
+  gen_prog main_prog;
   
   emit ctx Return;
   
@@ -764,6 +1309,11 @@ let generate_classes (prog : lambda list) : (string * bytes) list =
   let main_bytes = write_class_file class_file in
   let interface_bytes = generate_function_interface () in
   
+  (* Generate Module Classes *)
+  let module_classes = List.map (fun (name, decls) -> 
+    generate_module_class name decls ctx.functions ctx.externs
+  ) modules in
+  
   [("OnokiFunction.class", interface_bytes);
-   ("Main.class", main_bytes)] @ !global_closure_list
+   ("Main.class", main_bytes)] @ list_classes @ module_classes @ !global_closure_list
   

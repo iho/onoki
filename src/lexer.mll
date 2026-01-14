@@ -51,6 +51,7 @@ rule token = parse
   | '*'             { STAR }
   | '/'             { SLASH }
   | '%'             { MOD }
+  | '^'             { HAT }
   | '='             { EQ }
   | "<>"            { NE }
   | '<'             { LT }
@@ -59,12 +60,14 @@ rule token = parse
   | ">="            { GE }
   | "->"            { ARROW }
   | "::"            { CONS }
+  | ':'             { COLON }
   | '.'             { DOT }
   | ';'             { SEMICOLON }
   | ','             { COMMA }
   | '|'             { PIPE }
   | '_'             { UNDERSCORE }
   | alpha alnum* as id 
+  | '\'' alpha alnum* as id
       { try Hashtbl.find keyword_table id 
         with Not_found -> IDENT id }
   | eof             { EOF }

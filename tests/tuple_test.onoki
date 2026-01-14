@@ -1,0 +1,2 @@
+let t = (10, 20)
+let sum = match t with (x, y) -> x + y

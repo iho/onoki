@@ -7,8 +7,12 @@ type subst = (string * ty) list
 (* Type schemes for polymorphism *)
 type ty_scheme = Forall of string list * ty
 
-(* Type environment *)
-type env = (string * ty_scheme) list
+(* Environment bindings *)
+type binding =
+  | BindValue of ty_scheme
+  | BindModule of env
+
+and env = (string * binding) list
 
 (* Fresh type variable counter *)
 let fresh_var_counter = ref 0
@@ -42,6 +46,12 @@ let apply_subst_scheme (s : subst) (Forall (vars, t) : ty_scheme) : ty_scheme =
   (* Remove bindings for quantified variables *)
   let s' = List.filter (fun (v, _) -> not (List.mem v vars)) s in
   Forall (vars, apply_subst s' t)
+
+(* Apply substitution to a binding *)
+let rec apply_subst_binding (s : subst) (b : binding) : binding =
+  match b with
+  | BindValue scheme -> BindValue (apply_subst_scheme s scheme)
+  | BindModule env -> BindModule (List.map (fun (n, b) -> (n, apply_subst_binding s b)) env)
 
 (* Compose two substitutions *)
 let compose_subst (s1 : subst) (s2 : subst) : subst =
@@ -133,13 +143,42 @@ let free_vars_ty (t : ty) : string list =
     | _ -> acc
   in go [] t
 
+(* Free type variables in a binding *)
+let rec free_vars_binding (b : binding) : string list =
+  match b with
+  | BindValue (Forall (vars, t)) ->
+      let fv = free_vars_ty t in
+      List.filter (fun v -> not (List.mem v vars)) fv
+  | BindModule env -> free_vars_env env
+
 (* Free type variables in an environment *)
-let free_vars_env (env : env) : string list =
-  List.fold_left (fun acc (_, Forall (vars, t)) ->
-    let fv = free_vars_ty t in
-    let free = List.filter (fun v -> not (List.mem v vars)) fv in
-    List.fold_left (fun acc v -> if List.mem v acc then acc else v :: acc) acc free
+and free_vars_env (env : env) : string list =
+  List.fold_left (fun acc (_, b) ->
+    let fv = free_vars_binding b in
+    List.fold_left (fun acc v -> if List.mem v acc then acc else v :: acc) acc fv
   ) [] env
+
+(* Recursive lookup for module members *)
+let lookup_var (env : env) (name : string) : ty_scheme option =
+  if String.contains name '.' then
+    let parts = String.split_on_char '.' name in
+    let rec traverse_env current_env path =
+      match path with
+      | [] -> None
+      | [x] -> (
+          match List.assoc_opt x current_env with
+          | Some (BindValue scheme) -> Some scheme
+          | _ -> None)
+      | m :: rest -> (
+          match List.assoc_opt m current_env with
+          | Some (BindModule inner_env) -> traverse_env inner_env rest
+          | _ -> None)
+    in
+    traverse_env env parts
+  else
+    match List.assoc_opt name env with
+    | Some (BindValue scheme) -> Some scheme
+    | _ -> None
 
 (* Generalization - create a type scheme *)
 let generalize (env : env) (t : ty) : ty_scheme =
@@ -164,7 +203,7 @@ let rec infer (env : env) (expr : expr) : (ty * subst) option =
   
   (* Variables *)
   | Var x -> (
-      match List.assoc_opt x env with
+      match lookup_var env x with
       | Some scheme -> Some (instantiate scheme, [])
       | None -> None)
   
@@ -195,7 +234,7 @@ let rec infer (env : env) (expr : expr) : (ty * subst) option =
   (* Lambda abstraction *)
   | Fun (x, body) ->
       let arg_ty = TyVar (fresh_var ()) in
-      let env' = (x, Forall ([], arg_ty)) :: env in
+      let env' = (x, BindValue (Forall ([], arg_ty))) :: env in
       (match infer env' body with
        | Some (ret_ty, s) ->
            let arg_ty' = apply_subst s arg_ty in
@@ -206,8 +245,8 @@ let rec infer (env : env) (expr : expr) : (ty * subst) option =
   | App (f, arg) ->
       (match infer env f with
        | Some (tf, s1) ->
-           let env' = List.map (fun (v, scheme) ->
-             (v, apply_subst_scheme s1 scheme)) env in
+           let env' = List.map (fun (v, binding) ->
+             (v, apply_subst_binding s1 binding)) env in
            (match infer env' arg with
             | Some (targ, s2) ->
                 let s = compose_subst s2 s1 in
@@ -225,10 +264,10 @@ let rec infer (env : env) (expr : expr) : (ty * subst) option =
   | Let (x, e1, e2) ->
       (match infer env e1 with
        | Some (t1, s1) ->
-           let env' = List.map (fun (v, scheme) ->
-             (v, apply_subst_scheme s1 scheme)) env in
+           let env' = List.map (fun (v, binding) ->
+             (v, apply_subst_binding s1 binding)) env in
            let scheme = generalize env' t1 in
-           let env'' = (x, scheme) :: env' in
+           let env'' = (x, BindValue scheme) :: env' in
            (match infer env'' e2 with
             | Some (t2, s2) -> Some (t2, compose_subst s2 s1)
             | None -> None)
@@ -237,17 +276,17 @@ let rec infer (env : env) (expr : expr) : (ty * subst) option =
   (* Recursive let binding *)
   | LetRec (x, e1, e2) ->
       let rec_ty = TyVar (fresh_var ()) in
-      let env' = (x, Forall ([], rec_ty)) :: env in
+      let env' = (x, BindValue (Forall ([], rec_ty))) :: env in
       (match infer env' e1 with
        | Some (t1, s1) ->
            (match unify (apply_subst s1 rec_ty) t1 with
             | Some s2 ->
                 let s = compose_subst s2 s1 in
-                let env'' = List.map (fun (v, scheme) ->
-                  (v, apply_subst_scheme s scheme)) env in
+                let env'' = List.map (fun (v, binding) ->
+                  (v, apply_subst_binding s binding)) env in
                 let final_ty = apply_subst s rec_ty in
                 let scheme = generalize env'' final_ty in
-                let env''' = (x, scheme) :: env'' in
+                let env''' = (x, BindValue scheme) :: env'' in
                 (match infer env''' e2 with
                  | Some (t2, s3) -> Some (t2, compose_subst s3 s)
                  | None -> None)
@@ -261,13 +300,13 @@ let rec infer (env : env) (expr : expr) : (ty * subst) option =
            (match unify tcond TyBool with
             | Some s2 ->
                 let s = compose_subst s2 s1 in
-                let env' = List.map (fun (v, scheme) ->
-                  (v, apply_subst_scheme s scheme)) env in
+                let env' = List.map (fun (v, binding) ->
+                  (v, apply_subst_binding s binding)) env in
                 (match infer env' then_ with
                  | Some (t1, s3) ->
                      let s' = compose_subst s3 s in
-                     let env'' = List.map (fun (v, scheme) ->
-                       (v, apply_subst_scheme s' scheme)) env in
+                     let env'' = List.map (fun (v, binding) ->
+                       (v, apply_subst_binding s' binding)) env in
                      (match infer env'' else_ with
                       | Some (t2, s4) ->
                           let s'' = compose_subst s4 s' in
@@ -288,8 +327,8 @@ let rec infer (env : env) (expr : expr) : (ty * subst) option =
       let rec infer_all env acc_types acc_subst = function
         | [] -> Some (List.rev acc_types, acc_subst)
         | e :: es ->
-            let env' = List.map (fun (v, scheme) ->
-              (v, apply_subst_scheme acc_subst scheme)) env in
+            let env' = List.map (fun (v, binding) ->
+              (v, apply_subst_binding acc_subst binding)) env in
             (match infer env' e with
              | Some (t, s) ->
                  let s' = compose_subst s acc_subst in
@@ -311,8 +350,8 @@ let rec infer (env : env) (expr : expr) : (ty * subst) option =
            let rec check_all env acc_subst = function
              | [] -> Some acc_subst
              | e :: es ->
-                 let env' = List.map (fun (v, scheme) ->
-                   (v, apply_subst_scheme acc_subst scheme)) env in
+                 let env' = List.map (fun (v, binding) ->
+                   (v, apply_subst_binding acc_subst binding)) env in
                  (match infer env' e with
                   | Some (t, s) ->
                       let s' = compose_subst s acc_subst in
@@ -336,8 +375,8 @@ let rec infer (env : env) (expr : expr) : (ty * subst) option =
   | Cons (e1, e2) ->
       (match infer env e1 with
        | Some (elem_ty, s1) ->
-           let env' = List.map (fun (v, scheme) ->
-             (v, apply_subst_scheme s1 scheme)) env in
+           let env' = List.map (fun (v, binding) ->
+             (v, apply_subst_binding s1 binding)) env in
            (match infer env' e2 with
             | Some (list_ty, s2) ->
                 let s = compose_subst s2 s1 in
@@ -407,54 +446,120 @@ and infer_binop (env : env) (op : binop) (e1 : expr) (e2 : expr) : (ty * subst) 
             | None -> None)
        | _ -> None)
 
+  | Concat ->
+      (* String: string ^ string -> string *)
+      (match infer env e1, infer env e2 with
+       | Some (t1, s1), Some (t2, s2) ->
+           let s = compose_subst s2 s1 in
+           (match unify (apply_subst s t1) TyString with
+            | Some s3 ->
+                let s' = compose_subst s3 s in
+                (match unify (apply_subst s' t2) TyString with
+                 | Some s4 -> Some (TyString, compose_subst s4 s')
+                 | None -> None)
+            | None -> None)
+       | _ -> None)
+
 
 (* Type check a single declaration *)
-let type_check_decl (env : env) (decl : decl) : ((string * ty) * env) option =
+let rec type_check_decl (env : env) (decl : decl) : ((string * binding) * env) option =
   match decl with
   | DeclLet (name, expr) -> (
       match infer env expr with
       | Some (ty, s) ->
-          let env' = List.map (fun (v, scheme) ->
-            (v, apply_subst_scheme s scheme)) env in
+          let env' = List.map (fun (v, binding) ->
+            (v, apply_subst_binding s binding)) env in
           let scheme = generalize env' ty in
-          let env'' = (name, scheme) :: env' in
-          Some ((name, ty), env'')
+          let binding = BindValue scheme in
+          let env'' = (name, binding) :: env' in
+          Some ((name, binding), env'')
       | None -> None)
   
   | DeclLetRec (name, expr) ->
       let rec_ty = TyVar (fresh_var ()) in
-      let env' = (name, Forall ([], rec_ty)) :: env in
+      let env' = (name, BindValue (Forall ([], rec_ty))) :: env in
       (match infer env' expr with
        | Some (ty, s) ->
            (match unify (apply_subst s rec_ty) ty with
             | Some s2 ->
                 let s_final = compose_subst s2 s in
-                let env'' = List.map (fun (v, scheme) ->
-                  (v, apply_subst_scheme s_final scheme)) env in
+                let env'' = List.map (fun (v, binding) ->
+                  (v, apply_subst_binding s_final binding)) env in
                 let final_ty = apply_subst s_final rec_ty in
                 let scheme = generalize env'' final_ty in
-                let env''' = (name, scheme) :: env'' in
-                Some ((name, final_ty), env''')
+                let binding = BindValue scheme in
+                let env''' = (name, binding) :: env'' in
+                Some ((name, binding), env''')
             | None -> None)
        | None -> None)
   
-  | _ -> None  (* Skip other declarations for now *)
+  | DeclExtern (name, ty, _impl) ->
+      (* External declaration: trust the type *)
+      let scheme = generalize env ty in
+      let binding = BindValue scheme in
+      Some ((name, binding), (name, binding) :: env)
+
+  | DeclModule (name, decls) ->
+      (* Type check module body using current env for lookups *)
+      (* We accumulate local bindings for the module environment *)
+      let rec check_module_decls local_env rest_decls =
+         match rest_decls with
+         | [] -> Some local_env
+         | d :: ds ->
+             (* Check d in (local_env + env) *)
+             let check_env = local_env @ env in
+             (match type_check_decl check_env d with
+              | Some ((n, b), _unused_env) ->
+                  check_module_decls ((n, b) :: local_env) ds
+              | None -> None)
+      in
+      (match check_module_decls [] decls with
+       | Some local_env ->
+           (* local_env has newest first, which is correct for env *)
+           let mod_binding = BindModule local_env in
+           Some ((name, mod_binding), (name, mod_binding) :: env)
+       | None -> None)
+  
+  | DeclType _ -> 
+       (* Types are handled separately or during resolution, ignoring for now *)
+       Some (("", BindValue (Forall([], TyTuple[]))), env) 
+
+(* Initial environment with built-ins *)
+let initial_env : env = [
+  ("add", BindValue (Forall ([], TyFun (TyInt, TyFun (TyInt, TyInt)))));
+  ("sub", BindValue (Forall ([], TyFun (TyInt, TyFun (TyInt, TyInt)))));
+  ("mul", BindValue (Forall ([], TyFun (TyInt, TyFun (TyInt, TyInt)))));
+  ("div", BindValue (Forall ([], TyFun (TyInt, TyFun (TyInt, TyInt)))));
+  ("mod", BindValue (Forall ([], TyFun (TyInt, TyFun (TyInt, TyInt)))));
+  ("eq", BindValue (Forall ([], TyFun (TyInt, TyFun (TyInt, TyBool)))));
+  ("ne", BindValue (Forall ([], TyFun (TyInt, TyFun (TyInt, TyBool)))));
+  ("lt", BindValue (Forall ([], TyFun (TyInt, TyFun (TyInt, TyBool)))));
+  ("le", BindValue (Forall ([], TyFun (TyInt, TyFun (TyInt, TyBool)))));
+  ("gt", BindValue (Forall ([], TyFun (TyInt, TyFun (TyInt, TyBool)))));
+  ("ge", BindValue (Forall ([], TyFun (TyInt, TyFun (TyInt, TyBool)))));
+  ("not", BindValue (Forall ([], TyFun (TyBool, TyBool))));
+  (* List primitives *)
+  ("cons", BindValue (Forall (["'a"], TyFun (TyVar "'a", TyFun (TyList (TyVar "'a"), TyList (TyVar "'a"))))));
+  ("head", BindValue (Forall (["'a"], TyFun (TyList (TyVar "'a"), TyVar "'a"))));
+  ("tail", BindValue (Forall (["'a"], TyFun (TyList (TyVar "'a"), TyList (TyVar "'a")))));
+  ("is_empty", BindValue (Forall (["'a"], TyFun (TyList (TyVar "'a"), TyBool))));
+]
 
 (* Type check an entire program *)
-let type_check_program (prog : program) : (string * ty) list option =
+let type_check_program (prog : program) : (string * binding) list option =
   reset_fresh_vars ();
   let rec go env acc = function
     | [] -> Some (List.rev acc)
     | decl :: rest ->
         (match type_check_decl env decl with
-         | Some ((name, ty), env') -> go env' ((name, ty) :: acc) rest
+         | Some ((name, binding), env') -> go env' ((name, binding) :: acc) rest
          | None -> None)
   in
-  go [] [] prog
+  go initial_env [] prog
 
 (* Simple type check for single expression (for backward compatibility) *)
 let type_check (expr : expr) : ty option =
   reset_fresh_vars ();
-  match infer [] expr with
+  match infer initial_env expr with
   | Some (ty, _) -> Some ty
   | None -> None

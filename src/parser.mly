@@ -10,13 +10,15 @@
 %token LPAREN RPAREN LBRACKET RBRACKET LBRACE RBRACE
 %token PLUS MINUS STAR SLASH MOD
 %token EQ NE LT LE GT GE
-%token ARROW CONS DOT SEMICOLON COMMA PIPE UNDERSCORE
+%token ARROW CONS COLON DOT SEMICOLON COMMA PIPE UNDERSCORE
+%token HAT
 %token EOF
 
 %left OR
 %left AND
 %left EQ NE LT LE GT GE
 %right CONS
+%right HAT
 %left PLUS MINUS
 %left STAR SLASH MOD
 %nonassoc NOT
@@ -37,8 +39,10 @@ decl:
       { DeclLetRec (name, e) }
   | TYPE name = IDENT EQ ty = type_expr
       { DeclType (name, ty) }
-  | EXTERNAL name = IDENT CONS ty = type_expr
-      { DeclExtern (name, ty) }
+  | EXTERNAL name = IDENT COLON ty = type_expr EQ impl = STRING
+      { DeclExtern (name, ty, impl) }
+  | MODULE name = IDENT EQ LBRACE decls = list(decl) RBRACE
+      { DeclModule (name, decls) }
 
 expr_top:
   | e = expr EOF { e }
@@ -56,6 +60,8 @@ expr:
       { Bool false }
   | x = IDENT 
       { Var x }
+  | m = IDENT DOT x = IDENT
+      { Var (m ^ "." ^ x) }
   | LPAREN e = expr RPAREN 
       { e }
   | LPAREN RPAREN
@@ -70,6 +76,8 @@ expr:
       { BinOp (Div, e1, e2) }
   | e1 = expr MOD e2 = expr 
       { BinOp (Mod, e1, e2) }
+  | e1 = expr HAT e2 = expr 
+      { BinOp (Concat, e1, e2) }
   | e1 = expr EQ e2 = expr 
       { BinOp (Eq, e1, e2) }
   | e1 = expr NE e2 = expr 
@@ -123,6 +131,7 @@ simple_expr:
   | TRUE { Bool true }
   | FALSE { Bool false }
   | x = IDENT { Var x }
+  | LPAREN RPAREN { Tuple [] }
   | LPAREN e = expr RPAREN { e }
   | LBRACKET elems = separated_list(SEMICOLON, expr) RBRACKET { List elems }
 
@@ -156,4 +165,26 @@ pattern_field:
   | name = IDENT EQ pat = pattern { (name, pat) }
 
 type_expr:
-  | IDENT { TyVar "TODO" }
+  | t1 = type_expr ARROW t2 = type_expr 
+      { TyFun (t1, t2) }
+  | t = type_simple 
+      { t }
+
+type_simple:
+  | name = IDENT 
+      { match name with
+        | "int" -> TyInt
+        | "float" -> TyFloat
+        | "bool" -> TyBool
+        | "string" -> TyString
+        | "unit" -> TyTuple []
+        | _ -> TyVar name }
+  | type_simple IDENT
+      { match $2 with
+        | "list" -> TyList $1
+        | _ -> failwith "Only list type constructor supported" }
+  | LPAREN t = type_expr RPAREN 
+      { t }
+  | LPAREN ts = separated_nonempty_list(COMMA, type_expr) RPAREN
+      { TyTuple ts }
+

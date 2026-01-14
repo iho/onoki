@@ -14,6 +14,8 @@ type lambda =
   | LTuple of lambda list
   | LField of lambda * int
   | LTry of lambda * (string * lambda)
+  | LExtern of string * string
+  | LModule of string * lambda list
 
 and constant =
   | CInt of int
@@ -77,6 +79,11 @@ let rec show_lambda = function
         (show_lambda body) 
         exn 
         (show_lambda handler)
+  | LExtern (name, impl) ->
+      Printf.sprintf "(extern %s = \"%s\")" name impl
+  | LModule (name, decls) ->
+      Printf.sprintf "(module %s {\n%s\n})" name
+        (String.concat "\n" (List.map show_lambda decls))
 
 (* Lowering from typed AST to Lambda form *)
 let rec lower_expr : expr -> lambda = function
@@ -87,25 +94,26 @@ let rec lower_expr : expr -> lambda = function
   | Var x -> LVar x
   | BinOp (op, e1, e2) ->
       let op_name = match op with
-        | Add -> "add"
-        | Sub -> "sub"
-        | Mul -> "mul"
-        | Div -> "div"
-        | Mod -> "mod"
-        | Eq -> "eq"
-        | Ne -> "ne"
-        | Lt -> "lt"
-        | Le -> "le"
-        | Gt -> "gt"
-        | Ge -> "ge"
-        | And -> "and"
-        | Or -> "or"
+        | Add -> "__add"
+        | Sub -> "__sub"
+        | Mul -> "__mul"
+        | Div -> "__div"
+        | Mod -> "__mod"
+        | Eq -> "__eq"
+        | Ne -> "__ne"
+        | Lt -> "__lt"
+        | Le -> "__le"
+        | Gt -> "__gt"
+        | Ge -> "__ge"
+        | And -> "__and"
+        | Or -> "__or"
+        | Concat -> "^" (* Concat matches ^ token, usually safe *)
       in
       LApp (LVar op_name, [lower_expr e1; lower_expr e2])
   | UnOp (op, e) ->
       let op_name = match op with
-        | Not -> "not"
-        | Neg -> "neg"
+        | Not -> "__not"
+        | Neg -> "__neg"
       in
       LApp (LVar op_name, [lower_expr e])
   | Fun (x, body) -> LFun ([x], lower_expr body)
@@ -164,13 +172,25 @@ and compile_match scrutinee cases : lambda =
         LLet (x, scrutinee, lower_expr e)
     | (PatWildcard, e) :: _ ->
         lower_expr e
+    | [(PatTuple pats, e)] ->
+        let rec bind_tuple i = function
+          | [] -> lower_expr e
+          | (PatVar x) :: rest ->
+              LLet (x, LField (scrutinee, i), bind_tuple (i + 1) rest)
+          | PatWildcard :: rest ->
+              bind_tuple (i + 1) rest
+          | _ -> failwith "TODO: complex tuple patterns in let"
+        in
+        bind_tuple 0 pats
     | _ -> failwith "TODO: complex pattern matching"
   in
   build_tree cases
 
-let lower_program : program -> lambda list = fun decls ->
+let rec lower_program : program -> lambda list = fun decls ->
   List.map (function
     | DeclLet (name, e) -> LLet (name, lower_expr e, LVar name)
     | DeclLetRec (name, e) -> LLetRec ([(name, lower_expr e)], LVar name)
+    | DeclExtern (name, _ty, impl) -> LExtern (name, impl)
+    | DeclModule (name, subdecls) -> LModule (name, lower_program subdecls)
     | _ -> failwith "TODO: other declarations"
   ) decls

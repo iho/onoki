@@ -16,7 +16,7 @@ type ty =
 type binop = 
   | Add | Sub | Mul | Div | Mod 
   | Eq | Ne | Lt | Le | Gt | Ge 
-  | And | Or
+  | And | Or | Concat
   [@@deriving show, eq]
 
 type unop = 
@@ -62,7 +62,7 @@ type decl =
   | DeclLetRec of string * expr
   | DeclType of string * ty
   | DeclModule of string * decl list
-  | DeclExtern of string * ty
+  | DeclExtern of string * ty * string
   [@@deriving show, eq]
 
 type program = decl list

@@ -1,0 +1,19 @@
+module Math = {
+  let pi = 314
+  
+  let add = fun x -> fun y -> x + y
+  
+  let double = fun n -> add n n
+}
+
+external int_to_string : int -> string = "static java/lang/String valueOf (I)Ljava/lang/String;"
+
+let val = Math.pi
+let sum = Math.add 10 20
+let dbl = Math.double 5
+
+let s1 = "Math.pi: " ^ (int_to_string val)
+let s2 = "Math.add 10 20: " ^ (int_to_string sum)
+let s3 = "Math.double 5: " ^ (int_to_string dbl)
+
+let res = s1 ^ "\n" ^ s2 ^ "\n" ^ s3

@@ -1,0 +1,12 @@
+external max : int -> int -> int = "static java/lang/Math max (II)I"
+external new_list : unit -> 'a list = "new java/util/ArrayList <init> ()V"
+external add : 'a list -> 'a -> bool = "virtual java/util/ArrayList add (Ljava/lang/Object;)Z"
+external size : 'a list -> int = "virtual java/util/ArrayList size ()I"
+
+let m = max 10 20
+let l = new_list ()
+let i1 = add l 100
+let i2 = add l 200
+let s = size l
+
+let result = m + s

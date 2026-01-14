@@ -1,0 +1,8 @@
+let l = [1; 2; 3; 4; 5]
+
+let sum =
+  let rec sum_helper = fun lst ->
+    if is_empty lst then 0
+    else (head lst) + (sum_helper (tail lst))
+  in
+  sum_helper l
