@@ -1,6 +1,6 @@
 (library
  (name onoki_lib)
- (modules ast typing lambda lexer parser)
+ (modules ast typing lambda lexer parser classfile jvminstr jvmgen)
  (preprocess
   (pps ppx_deriving.show ppx_deriving.eq)))
 

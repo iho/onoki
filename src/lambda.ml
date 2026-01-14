@@ -109,7 +109,10 @@ let rec lower_expr : expr -> lambda = function
       in
       LApp (LVar op_name, [lower_expr e])
   | Fun (x, body) -> LFun ([x], lower_expr body)
-  | App (f, arg) -> LApp (lower_expr f, [lower_expr arg])
+  | App (f, arg) ->
+      (match lower_expr f with
+      | LApp (f', args) -> LApp (f', args @ [lower_expr arg])
+      | f' -> LApp (f', [lower_expr arg]))
   | Let (x, e1, e2) -> LLet (x, lower_expr e1, lower_expr e2)
   | LetRec (x, e1, e2) -> LLetRec ([(x, lower_expr e1)], lower_expr e2)
   | If (cond, then_, else_) ->

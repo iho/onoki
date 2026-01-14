@@ -48,7 +48,21 @@ let () =
     ) lambda_ir;
     Printf.printf "\n";
 
-    Printf.printf "✓ Compilation completed successfully\n"
+    (* Generate JVM bytecode *)
+    Printf.printf "=== JVM Bytecode Generation ===\n";
+    (* Generate JVM bytecode *)
+    Printf.printf "=== JVM Bytecode Generation ===\n";
+    let classes = Onoki_lib.Jvmgen.generate_classes lambda_ir in
+    List.iter (fun (filename, bytecode) ->
+      let oc = open_out_bin filename in
+      output_bytes oc bytecode;
+      close_out oc;
+      Printf.printf "✓ Generated %s (%d bytes)\n" filename (Bytes.length bytecode)
+    ) classes;
+    Printf.printf "\n";
+
+    Printf.printf "✓ Compilation completed successfully\n";
+    Printf.printf "\nRun with: java Main\n"
 
   with
   | Onoki_lib.Lexer.LexError msg ->
