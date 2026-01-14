@@ -52,6 +52,7 @@ and pattern =
   | PatVar of string
   | PatWildcard
   | PatTuple of pattern list
+  | PatList of pattern list
   | PatCons of pattern * pattern
   | PatVariant of string * pattern option
   | PatRecord of (string * pattern) list

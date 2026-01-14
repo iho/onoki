@@ -155,36 +155,79 @@ let rec lower_expr : expr -> lambda = function
 
 (* Pattern matching compilation to decision trees *)
 and compile_match scrutinee cases : lambda =
-  (* Simple linear search - production would optimize to jump tables *)
-  let rec build_tree = function
-    | [] -> failwith "Non-exhaustive pattern match"
-    | [(PatWildcard, e)] -> lower_expr e
-    | [(PatVar x, e)] -> LLet (x, scrutinee, lower_expr e)
-    | [(PatInt i, e)] ->
-        LIf (LApp (LVar "eq", [scrutinee; LConst (CInt i)]),
-             lower_expr e,
-             failwith "Non-exhaustive pattern match")
-    | (PatInt i, e) :: rest ->
-        LIf (LApp (LVar "eq", [scrutinee; LConst (CInt i)]),
-             lower_expr e,
-             build_tree rest)
-    | (PatVar x, e) :: _ ->
-        LLet (x, scrutinee, lower_expr e)
-    | (PatWildcard, e) :: _ ->
-        lower_expr e
-    | [(PatTuple pats, e)] ->
-        let rec bind_tuple i = function
-          | [] -> lower_expr e
-          | (PatVar x) :: rest ->
-              LLet (x, LField (scrutinee, i), bind_tuple (i + 1) rest)
-          | PatWildcard :: rest ->
-              bind_tuple (i + 1) rest
-          | _ -> failwith "TODO: complex tuple patterns in let"
-        in
-        bind_tuple 0 pats
-    | _ -> failwith "TODO: complex pattern matching"
+  let counter = ref 0 in
+  let fresh_name prefix =
+    incr counter;
+    Printf.sprintf "%s_%d" prefix !counter
   in
-  build_tree cases
+  
+  let rec compile_pattern (scr : lambda) (pat : pattern) (next : lambda) (fail : lambda) : lambda =
+    match pat with
+    | PatWildcard -> next
+    | PatVar x -> LLet (x, scr, next)
+    | PatInt i ->
+        LIf (LApp (LVar "__eq", [scr; LConst (CInt i)]),
+             next,
+             fail)
+    | PatTuple pats ->
+        (* Match field by field *)
+        let rec match_fields i ps =
+          match ps with
+          | [] -> next
+          | p :: rest ->
+              let field_val = LField (scr, i) in
+              (* Note: fail code is duplicated here. In a production compiler, 
+                 we would use a join point (function) for failure. *)
+              compile_pattern field_val p (match_fields (i + 1) rest) fail
+        in
+        match_fields 0 pats
+    | PatCons (p1, p2) ->
+        (* Check if list is non-empty cell *)
+        (* Assuming runtime has is_empty or similar, or checking against Nil *)
+        (* For now, using OnokiCons check. But we only have primitives.
+           Let's assume we can check if it conforms to Cons. 
+           Actually, primitives are: head, tail, is_empty.
+           is_empty checks if it is Nil. *)
+        LIf (LApp (LVar "is_empty", [scr]),
+             fail,
+             let head_val = LApp (LVar "head", [scr]) in
+             let tail_val = LApp (LVar "tail", [scr]) in
+             compile_pattern head_val p1 
+               (compile_pattern tail_val p2 next fail) 
+               fail)
+    | PatList pats ->
+        let rec match_list_pats (s : lambda) (ps : pattern list) : lambda =
+          match ps with
+          | [] -> 
+              (* Check empty *)
+              LIf (LApp (LVar "is_empty", [s]), next, fail)
+          | p :: rest ->
+               (* Check not empty *)
+               LIf (LApp (LVar "is_empty", [s]),
+                    fail,
+                    let head_val = LApp (LVar "head", [s]) in
+                    let tail_val = LApp (LVar "tail", [s]) in
+                    compile_pattern head_val p
+                      (match_list_pats tail_val rest)
+                      fail)
+        in
+        match_list_pats scr pats
+    | _ -> failwith "Unsupported pattern in lower (Record/Variant)"
+  in
+
+  let scrutinee_var = fresh_name "match_scr" in
+  let scrutinee_ref = LVar scrutinee_var in
+  
+  let rec build_cases = function
+    | [] -> LApp (LVar "failwith", [LConst (CString "Match failed")])
+    | (pat, body) :: rest ->
+        let fail_code = build_cases rest in
+        (* Optimization: if pat is catch-all, don't generate fail code for this branch *)
+        (* But compile_pattern generates it. *)
+        compile_pattern scrutinee_ref pat (lower_expr body) fail_code
+  in
+  
+  LLet (scrutinee_var, scrutinee, build_cases cases)
 
 let rec lower_program : program -> lambda list = fun decls ->
   List.map (function

@@ -1,0 +1,30 @@
+external int_to_string : int -> string = "static java/lang/String valueOf (I)Ljava/lang/String;"
+external bool_to_string : bool -> string = "static java/lang/String valueOf (Z)Ljava/lang/String;"
+
+let test_int_match = fun x ->
+  match x with
+  | 0 -> true
+  | _ -> false
+
+let test_tuple_match = fun p ->
+  match p with
+  | (0, 0) -> 0
+  | (x, y) -> x + y
+
+
+let test_list_match = fun l ->
+  match l with
+  | [] -> 0
+  | x :: xs -> x
+
+let s1 = "Test 1 (0): " ^ (bool_to_string (test_int_match 0))
+let s2 = "Test 1 (1): " ^ (bool_to_string (test_int_match 1))
+let s3 = "Test 2 (0,0): " ^ (int_to_string (test_tuple_match (0,0)))
+let s4 = "Test 2 (10,20): " ^ (int_to_string (test_tuple_match (10,20)))
+
+let l1 = 1 :: 2 :: []
+let s5 = "Test 3 ([1,2]): " ^ (int_to_string (test_list_match l1))
+let s6 = "Test 3 ([]): " ^ (int_to_string (test_list_match []))
+
+let res = s1 ^ "\n" ^ s2 ^ "\n" ^ s3 ^ "\n" ^ s4 ^ "\n" ^ s5 ^ "\n" ^ s6
+

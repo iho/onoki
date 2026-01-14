@@ -131,8 +131,11 @@ simple_expr:
   | TRUE { Bool true }
   | FALSE { Bool false }
   | x = IDENT { Var x }
-  | LPAREN RPAREN { Tuple [] }
-  | LPAREN e = expr RPAREN { e }
+  | LPAREN es = separated_list(COMMA, expr) RPAREN 
+      { match es with
+        | [] -> Tuple []
+        | [e] -> e
+        | _ -> Tuple es }
   | LBRACKET elems = separated_list(SEMICOLON, expr) RBRACKET { List elems }
 
 field_binding:
@@ -156,6 +159,8 @@ pattern:
         | [] -> PatWildcard
         | [p] -> p
         | _ -> PatTuple pats }
+  | LBRACKET pats = separated_list(SEMICOLON, pattern) RBRACKET
+      { PatList pats }
   | p1 = pattern CONS p2 = pattern 
       { PatCons (p1, p2) }
   | LBRACE fields = separated_list(SEMICOLON, pattern_field) RBRACE 

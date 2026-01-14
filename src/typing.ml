@@ -192,6 +192,80 @@ let instantiate (Forall (vars, t) : ty_scheme) : ty =
   let subst = List.map (fun v -> (v, TyVar (fresh_var ()))) vars in
   apply_subst subst t
 
+(* Inference for patterns *)
+let rec infer_pattern (env : env) (pat : pattern) (expected_ty : ty) : (env * subst) option =
+  match pat with
+  | PatWildcard -> Some (env, [])
+  
+  | PatVar x ->
+      (* Add variable to environment with the expected type *)
+      let binding = BindValue (Forall ([], expected_ty)) in
+      Some ((x, binding) :: env, [])
+      
+  | PatInt _ ->
+      (match unify expected_ty TyInt with
+       | Some s -> Some (env, s)
+       | None -> None)
+
+  | PatTuple pats ->
+      (* Create fresh types for elements *)
+      let elem_tys = List.map (fun _ -> TyVar (fresh_var ())) pats in
+      let tuple_ty = TyTuple elem_tys in
+      (match unify expected_ty tuple_ty with
+       | Some s ->
+           let rec check_pats env acc_subst tys ps =
+             match tys, ps with
+             | [], [] -> Some (env, acc_subst)
+             | t :: rest_tys, p :: rest_ps ->
+                 let t' = apply_subst acc_subst t in
+                 (match infer_pattern env p t' with
+                  | Some (env', s') ->
+                      let s_final = compose_subst s' acc_subst in
+                      check_pats env' s_final rest_tys rest_ps
+                  | None -> None)
+             | _ -> None
+           in
+           check_pats env s elem_tys pats
+       | None -> None)
+
+  | PatList pats ->
+       let elem_ty = TyVar (fresh_var ()) in
+       let list_ty = TyList elem_ty in
+       (match unify expected_ty list_ty with
+        | Some s ->
+            let elem_ty' = apply_subst s elem_ty in
+            let rec check_list env acc_subst = function
+              | [] -> Some (env, acc_subst)
+              | p :: ps ->
+                   let t_elem = apply_subst acc_subst elem_ty' in
+                   (match infer_pattern env p t_elem with
+                    | Some (env', s') ->
+                        let s_next = compose_subst s' acc_subst in
+                        check_list env' s_next ps
+                    | None -> None)
+            in
+            check_list env s pats
+        | None -> None)
+  
+  | PatCons (p1, p2) ->
+       let elem_ty = TyVar (fresh_var ()) in
+       let list_ty = TyList elem_ty in
+       (match unify expected_ty list_ty with
+        | Some s ->
+            let elem_ty' = apply_subst s elem_ty in
+            (match infer_pattern env p1 elem_ty' with
+             | Some (env', s1) ->
+                 let s_mid = compose_subst s1 s in
+                 let list_ty' = apply_subst s_mid list_ty in
+                 (match infer_pattern env' p2 list_ty' with
+                  | Some (env'', s2) ->
+                      Some (env'', compose_subst s2 s_mid)
+                  | None -> None)
+             | None -> None)
+        | None -> None)
+
+  | _ -> None (* TODO: other patterns *)
+
 (* Main type inference function *)
 let rec infer (env : env) (expr : expr) : (ty * subst) option =
   match expr with
@@ -388,9 +462,42 @@ let rec infer (env : env) (expr : expr) : (ty * subst) option =
                  | None -> None)
             | None -> None)
        | None -> None)
-  
+
+  (* Pattern Match *)
+  | Match (scrutinee, cases) ->
+      (match infer env scrutinee with
+       | Some (t_scr, s_scr) ->
+           let ret_ty = TyVar (fresh_var ()) in
+           
+           let rec check_cases acc_subst = function
+             | [] -> Some (apply_subst acc_subst ret_ty, acc_subst)
+             | (pat, body) :: rest ->
+                 let t_scr' = apply_subst acc_subst t_scr in
+                 (match infer_pattern env pat t_scr' with
+                  | Some (env_pat, s_pat) ->
+                      let s_case = compose_subst s_pat acc_subst in
+                      (* Apply subst to environment so body sees constraints *)
+                      let env_body = List.map (fun (v, b) -> (v, apply_subst_binding s_case b)) env_pat in
+                      
+                      (match infer env_body body with
+                       | Some (t_body, s_body) ->
+                           let s_final_case = compose_subst s_body s_case in
+                           let ret_ty' = apply_subst s_final_case ret_ty in
+                           let t_body' = apply_subst s_final_case t_body in
+                           
+                           (match unify ret_ty' t_body' with
+                            | Some s_unify ->
+                                let s_res = compose_subst s_unify s_final_case in
+                                check_cases s_res rest
+                            | None -> None)
+                       | None -> None)
+                  | None -> None)
+           in
+           check_cases s_scr cases
+       | None -> None)
+
   (* Other cases - TODO *)
-  | Match _ | Variant _ | Record _ | Field _ | Seq _ -> None
+  | Variant _ | Record _ | Field _ | Seq _ -> None
 
 (* Type inference for binary operators *)
 and infer_binop (env : env) (op : binop) (e1 : expr) (e2 : expr) : (ty * subst) option =

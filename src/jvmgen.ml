@@ -53,7 +53,7 @@ let rec free_vars (expr : lambda) : StringSet.t =
       if List.mem x ["__add"; "__sub"; "__mul"; "__div"; "__mod"; 
                      "__eq"; "__ne"; "__lt"; "__le"; "__gt"; "__ge"; 
                      "__and"; "__or"; "__not"; "__neg";
-                     "cons"; "nil"; "head"; "tail"; "is_empty"; "^"] then
+                     "cons"; "nil"; "head"; "tail"; "is_empty"; "^"; "failwith"] then
         StringSet.empty 
       else 
         StringSet.singleton x
@@ -469,6 +469,17 @@ let rec gen_lambda (ctx : codegen_ctx) (expr : lambda) : unit =
       else
         emit ctx (Astore slot);
       gen_lambda ctx e2
+
+  | LApp (LVar "failwith", [msg]) ->
+      gen_lambda ctx msg;
+      (* Create RuntimeException *)
+      let ex_idx = add_class ctx.cpb "java/lang/RuntimeException" in
+      emit ctx (New ex_idx);
+      emit ctx Dup_x1; (* Stack: ref, msg, ref *)
+      emit ctx Swap;   (* Stack: ref, ref, msg *)
+      let init_idx = add_methodref ctx.cpb "java/lang/RuntimeException" "<init>" "(Ljava/lang/String;)V" in
+      emit ctx (Invokespecial init_idx);
+      emit ctx Athrow
 
   | LApp (LVar "cons", [head; tail]) ->
       let cons_idx = add_class ctx.cpb "OnokiCons" in
